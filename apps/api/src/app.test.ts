@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { decryptSecret, parseMasterKey } from "@orgops/crypto";
 import { createDrizzleDb, migrate, openDb, schema } from "@orgops/db";
 import { createApp } from "./app";
 
@@ -88,6 +89,183 @@ describe("api app", () => {
     expect(loginRes.status).toBe(401);
 
     rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("seeds a system agent only when a provider model and API key are configured", async () => {
+    const masterKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    const previousMasterKey = process.env.ORGOPS_MASTER_KEY;
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ORGOPS_MASTER_KEY = masterKey;
+    process.env.OPENAI_API_KEY = "sk-test-openai";
+    delete process.env.ANTHROPIC_API_KEY;
+
+    try {
+      const unconfiguredDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+      const unconfiguredDb = openDb(":memory:");
+      const unconfigured = createApp({
+        db: unconfiguredDb,
+        dataDir: unconfiguredDir,
+        adminUser: "admin",
+        adminPass: "admin",
+      });
+      const unconfiguredLogin = await unconfigured.app.request(
+        "http://localhost/api/auth/login",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ username: "admin", password: "admin" }),
+        },
+      );
+      const unconfiguredCookie = unconfiguredLogin.headers.get("set-cookie") ?? "";
+      const missingModel = await unconfigured.app.request(
+        "http://localhost/api/agents/system",
+        { headers: { cookie: unconfiguredCookie } },
+      );
+      expect(missingModel.status).toBe(404);
+      rmSync(unconfiguredDir, { recursive: true, force: true });
+
+      const missingKeyDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+      const missingKeyDb = openDb(":memory:");
+      delete process.env.ANTHROPIC_API_KEY;
+      createApp({
+        db: missingKeyDb,
+        dataDir: missingKeyDir,
+        adminUser: "admin",
+        adminPass: "admin",
+        systemAgentModel: "anthropic",
+      });
+      const missingKeyOrm = createDrizzleDb(missingKeyDb);
+      expect(
+        missingKeyOrm
+          .select({ name: schema.agents.name })
+          .from(schema.agents)
+          .all(),
+      ).toEqual([]);
+      rmSync(missingKeyDir, { recursive: true, force: true });
+
+      const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+      const db = openDb(":memory:");
+      const { app } = createApp({
+        db,
+        dataDir,
+        adminUser: "admin",
+        adminPass: "admin",
+        systemAgentModel: "openai:gpt-4o-mini",
+      });
+      const loginRes = await app.request("http://localhost/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: "admin", password: "admin" }),
+      });
+      expect(loginRes.status).toBe(200);
+      const cookie = loginRes.headers.get("set-cookie") ?? "";
+      const agentRes = await app.request("http://localhost/api/agents/system", {
+        headers: { cookie },
+      });
+      expect(agentRes.status).toBe(200);
+      const agent = (await agentRes.json()) as {
+        name?: string;
+        modelId?: string;
+        visibility?: string;
+        desiredState?: string;
+        workspacePath?: string;
+      };
+      expect(agent.name).toBe("system");
+      expect(agent.modelId).toBe("openai:gpt-4o-mini");
+      expect(agent.visibility).toBe("PUBLIC");
+      expect(agent.desiredState).toBe("RUNNING");
+      expect(agent.workspacePath).toBe(join(dataDir, "workspaces", "system"));
+
+      const orm = createDrizzleDb(db);
+      const secret = orm
+        .select({
+          name: schema.secrets.name,
+          scopeType: schema.secrets.scope_type,
+          ciphertext: schema.secrets.ciphertext_b64,
+        })
+        .from(schema.secrets)
+        .where(eq(schema.secrets.name, "OPENAI_API_KEY"))
+        .get() as
+        | { name: string; scopeType: string; ciphertext: string }
+        | undefined;
+      expect(secret?.scopeType).toBe("public");
+      expect(decryptSecret(parseMasterKey(masterKey), secret?.ciphertext ?? "")).toBe(
+        "sk-test-openai",
+      );
+      const model = orm
+        .select({
+          provider: schema.models.provider,
+          modelName: schema.models.model_name,
+          enabled: schema.models.enabled,
+        })
+        .from(schema.models)
+        .where(eq(schema.models.id, "openai:gpt-4o-mini"))
+        .get() as
+        | { provider: string; modelName: string; enabled: number }
+        | undefined;
+      expect(model).toEqual({
+        provider: "openai",
+        modelName: "gpt-4o-mini",
+        enabled: 1,
+      });
+      rmSync(dataDir, { recursive: true, force: true });
+    } finally {
+      if (previousMasterKey === undefined) delete process.env.ORGOPS_MASTER_KEY;
+      else process.env.ORGOPS_MASTER_KEY = previousMasterKey;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+      if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+    }
+  });
+
+  it("does not seed a system agent when any agent already exists", async () => {
+    const masterKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    const previousMasterKey = process.env.ORGOPS_MASTER_KEY;
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    process.env.ORGOPS_MASTER_KEY = masterKey;
+    process.env.OPENAI_API_KEY = "sk-test-openai";
+
+    try {
+      const db = openDb(":memory:");
+      migrate(db);
+      const orm = createDrizzleDb(db);
+      const now = Date.now();
+      orm
+        .insert(schema.agents)
+        .values({
+          id: randomUUID(),
+          name: "existing-agent",
+          model_id: "openai:gpt-4o-mini",
+          workspace_path: "/tmp/existing-workspace",
+          created_at: now,
+          updated_at: now,
+        })
+        .run();
+
+      const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+      createApp({
+        db,
+        dataDir,
+        adminUser: "admin",
+        adminPass: "admin",
+        systemAgentModel: "openai:gpt-4o-mini",
+      });
+      const names = orm
+        .select({ name: schema.agents.name })
+        .from(schema.agents)
+        .all()
+        .map((row) => row.name);
+      expect(names).toEqual(["existing-agent"]);
+      expect(orm.select({ id: schema.secrets.id }).from(schema.secrets).all()).toEqual([]);
+      rmSync(dataDir, { recursive: true, force: true });
+    } finally {
+      if (previousMasterKey === undefined) delete process.env.ORGOPS_MASTER_KEY;
+      else process.env.ORGOPS_MASTER_KEY = previousMasterKey;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    }
   });
 
   it("registers runners and filters agents by assigned runner", async () => {
@@ -1412,6 +1590,187 @@ describe("api app", () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
+  it("invites humans into an existing channel", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+    const db = openDb(":memory:");
+    const { app } = createApp({
+      db,
+      dataDir,
+      adminUser: "admin",
+      adminPass: "admin",
+      runnerToken: "test-token",
+    });
+
+    const adminLoginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "admin" }),
+    });
+    expect(adminLoginRes.status).toBe(200);
+    const adminCookie = adminLoginRes.headers.get("set-cookie") ?? "";
+
+    const createChannelRes = await app.request("http://localhost/api/channels", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: adminCookie },
+      body: JSON.stringify({
+        name: "invite-existing-channel",
+        visibility: "PRIVATE",
+      }),
+    });
+    expect(createChannelRes.status).toBe(201);
+    const channel = (await createChannelRes.json()) as { id: string };
+
+    const inviteRes = await app.request("http://localhost/api/humans/invite", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: adminCookie },
+      body: JSON.stringify({
+        username: "channel-alice",
+        tempPassword: "alice-temp-pass",
+        channelId: channel.id,
+      }),
+    });
+    expect(inviteRes.status).toBe(201);
+    const invite = (await inviteRes.json()) as {
+      channel?: { id: string; created: boolean };
+      temporaryPassword: string;
+    };
+    expect(invite.channel).toEqual({
+      id: channel.id,
+      name: "invite-existing-channel",
+      created: false,
+    });
+    expect(invite.temporaryPassword).toBe("alice-temp-pass");
+
+    const aliceLoginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: "channel-alice",
+        password: "alice-temp-pass",
+      }),
+    });
+    expect(aliceLoginRes.status).toBe(200);
+    const aliceCookie = aliceLoginRes.headers.get("set-cookie") ?? "";
+    const profileRes = await app.request("http://localhost/api/auth/profile", {
+      method: "PATCH",
+      headers: { "content-type": "application/json", cookie: aliceCookie },
+      body: JSON.stringify({
+        username: "channel-alice",
+        newPassword: "alice-password-123",
+      }),
+    });
+    expect(profileRes.status).toBe(200);
+
+    const channelsRes = await app.request("http://localhost/api/channels", {
+      headers: { cookie: aliceCookie },
+    });
+    expect(channelsRes.status).toBe(200);
+    const channels = (await channelsRes.json()) as Array<{
+      id: string;
+      canPost?: boolean;
+      participants?: Array<{ subscriberType: string; subscriberId: string }>;
+    }>;
+    const landed = channels.find((entry) => entry.id === channel.id);
+    expect(landed?.canPost).toBe(true);
+    expect(landed?.participants).toContainEqual({
+      subscriberType: "HUMAN",
+      subscriberId: "channel-alice",
+    });
+
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("creates a channel with agent participants while inviting a human", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+    const db = openDb(":memory:");
+    const { app } = createApp({
+      db,
+      dataDir,
+      adminUser: "admin",
+      adminPass: "admin",
+      runnerToken: "test-token",
+    });
+
+    const adminLoginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "admin" }),
+    });
+    expect(adminLoginRes.status).toBe(200);
+    const adminCookie = adminLoginRes.headers.get("set-cookie") ?? "";
+    await createProcessTestAgent(app, adminCookie, "invite-scout");
+    await createProcessTestAgent(app, adminCookie, "invite-scribe");
+
+    const inviteRes = await app.request("http://localhost/api/humans/invite", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: adminCookie },
+      body: JSON.stringify({
+        username: "channel-bob",
+        tempPassword: "bob-temp-pass",
+        channelName: "invite-new-channel",
+        channelDescription: "Invite landing room",
+        agentParticipants: ["invite-scout", "invite-scribe", "invite-scout"],
+      }),
+    });
+    expect(inviteRes.status).toBe(201);
+    const invite = (await inviteRes.json()) as {
+      channel?: { id: string; name: string; created: boolean };
+    };
+    expect(invite.channel?.name).toBe("invite-new-channel");
+    expect(invite.channel?.created).toBe(true);
+    expect(typeof invite.channel?.id).toBe("string");
+
+    const participantsRes = await app.request(
+      `http://localhost/api/channels/${invite.channel?.id}/participants`,
+      { headers: { cookie: adminCookie } },
+    );
+    expect(participantsRes.status).toBe(200);
+    const participants = (await participantsRes.json()) as Array<{
+      subscriberType: string;
+      subscriberId: string;
+    }>;
+    expect(participants).toEqual([
+      { subscriberType: "AGENT", subscriberId: "invite-scout" },
+      { subscriberType: "AGENT", subscriberId: "invite-scribe" },
+      { subscriberType: "HUMAN", subscriberId: "admin" },
+      { subscriberType: "HUMAN", subscriberId: "channel-bob" },
+    ]);
+
+    const bobLoginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: "channel-bob",
+        password: "bob-temp-pass",
+      }),
+    });
+    expect(bobLoginRes.status).toBe(200);
+    const bobCookie = bobLoginRes.headers.get("set-cookie") ?? "";
+    const profileRes = await app.request("http://localhost/api/auth/profile", {
+      method: "PATCH",
+      headers: { "content-type": "application/json", cookie: bobCookie },
+      body: JSON.stringify({
+        username: "channel-bob",
+        newPassword: "bob-password-123",
+      }),
+    });
+    expect(profileRes.status).toBe(200);
+
+    const bobChannelsRes = await app.request("http://localhost/api/channels", {
+      headers: { cookie: bobCookie },
+    });
+    expect(bobChannelsRes.status).toBe(200);
+    const bobChannels = (await bobChannelsRes.json()) as Array<{
+      id: string;
+      canPost?: boolean;
+    }>;
+    expect(
+      bobChannels.find((entry) => entry.id === invite.channel?.id)?.canPost,
+    ).toBe(true);
+
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
   it("resets an existing human to a new temporary password", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
     const db = openDb(":memory:");
@@ -1993,7 +2352,6 @@ describe("api app", () => {
       body: JSON.stringify({
         name: "agent-one",
         modelId: "test:model",
-        systemInstructions: "",
         workspacePath: ".orgops-data/workspaces/agent-one",
       }),
     });
@@ -2155,7 +2513,6 @@ describe("api app", () => {
       body: JSON.stringify({
         name: "agent-bulk-delete",
         modelId: "test:model",
-        systemInstructions: "",
         workspacePath: ".orgops-data/workspaces/agent-bulk-delete",
       }),
     });
@@ -2611,7 +2968,6 @@ describe("api app", () => {
       body: JSON.stringify({
         name: "coordinator",
         modelId: "test:model",
-        systemInstructions: "",
         workspacePath: ".orgops-data/workspaces/coordinator",
       }),
     });
