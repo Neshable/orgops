@@ -17,6 +17,34 @@ const agentsSearchSchema = z.object({
   limit: z.number().int().min(1).max(500).optional(),
 });
 
+const agentsCopySchema = z.object({
+  sourceAgentName: z.string().min(1),
+  name: z.string().min(1),
+  assignedRunnerId: z.string().nullable().optional(),
+  workspacePath: z.string().min(1).optional(),
+  desiredState: desiredStateSchema.optional(),
+  copyChannelMemberships: z.boolean().optional(),
+  federationInstanceId: z.string().min(1).optional(),
+});
+
+const agentsMoveSchema = z
+  .object({
+    agentName: z.string().min(1),
+    assignedRunnerId: z.string().nullable().optional(),
+    federationInstanceId: z.string().min(1).optional(),
+    name: z.string().min(1).optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.federationInstanceId) return;
+    if (value.assignedRunnerId === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["assignedRunnerId"],
+        message: "assignedRunnerId is required for a local move; use null to unassign.",
+      });
+    }
+  });
+
 const agentsCreateSchema = z.object({
   name: z.string().min(1),
   icon: z.string().optional(),
@@ -102,6 +130,16 @@ export const agentsToolDefs: ToolDef[] = [
     agentsSearchSchema,
   ],
   [
+    "agents_copy",
+    "Copy an agent, including enabled skills, agent-local skills, private secrets that are not already public or package secrets, workspace files, and channel plus cross-channel memory. Pass federationInstanceId to copy onto a federated peer.",
+    agentsCopySchema,
+  ],
+  [
+    "agents_move",
+    "Move an agent to another local runner, or pass federationInstanceId to move it to a federated peer with its skills, private secrets, workspace files, and memory. Running processes are stopped. Local moves keep the workspace path. Use assignedRunnerId null to unassign.",
+    agentsMoveSchema,
+  ],
+  [
     "agents_update",
     "Update an existing OrgOps agent via the agent API. Use wrappedConfig for object input or wrappedConfigJson for a JSON string when patching wrapped runtime config.",
     agentsUpdateSchema,
@@ -185,6 +223,63 @@ export async function execute(
     });
     const limited = parsed.limit ? filtered.slice(0, parsed.limit) : filtered;
     return { agents: limited, totalMatched: filtered.length, filters: parsed };
+  }
+
+  if (tool === "agents_copy") {
+    const parsedResult = parseToolArgs(tool, agentsCopySchema, args);
+    if (!parsedResult.ok) return { error: parsedResult.error };
+    const parsed = parsedResult.data;
+    const sourceAgentName = parsed.sourceAgentName.trim();
+    const name = parsed.name.trim();
+    const body: Record<string, unknown> = {
+      name,
+      ...(parsed.assignedRunnerId !== undefined
+        ? { assignedRunnerId: trimOptional(parsed.assignedRunnerId ?? undefined) ?? null }
+        : {}),
+      ...(parsed.workspacePath !== undefined ? { workspacePath: parsed.workspacePath.trim() } : {}),
+      ...(parsed.desiredState !== undefined ? { desiredState: parsed.desiredState } : {}),
+      ...(parsed.copyChannelMemberships !== undefined
+        ? { copyChannelMemberships: parsed.copyChannelMemberships }
+        : {}),
+      ...(parsed.federationInstanceId !== undefined
+        ? { federationInstanceId: parsed.federationInstanceId.trim() }
+        : {}),
+    };
+    const response = await ctx.apiFetch(
+      `/api/agents/${encodeURIComponent(sourceAgentName)}/copy`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    const copied = await parseResponseBody(response);
+    return { ok: true, sourceAgentName, agentName: name, copied };
+  }
+
+  if (tool === "agents_move") {
+    const parsedResult = parseToolArgs(tool, agentsMoveSchema, args);
+    if (!parsedResult.ok) return { error: parsedResult.error };
+    const parsed = parsedResult.data;
+    const agentName = parsed.agentName.trim();
+    const response = await ctx.apiFetch(
+      `/api/agents/${encodeURIComponent(agentName)}/move`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...(parsed.assignedRunnerId !== undefined
+            ? { assignedRunnerId: trimOptional(parsed.assignedRunnerId ?? undefined) ?? null }
+            : {}),
+          ...(parsed.federationInstanceId !== undefined
+            ? { federationInstanceId: parsed.federationInstanceId.trim() }
+            : {}),
+          ...(parsed.name !== undefined ? { name: parsed.name.trim() } : {}),
+        }),
+      },
+    );
+    const moved = await parseResponseBody(response);
+    return { ok: true, agentName, moved };
   }
 
   if (tool === "agents_update") {

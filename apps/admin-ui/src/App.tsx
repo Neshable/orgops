@@ -17,6 +17,7 @@ import {
   ChatScreen,
   BillingScreen,
   EventsScreen,
+  FederationScreen,
   ProcessesScreen,
   RunnersScreen,
   SkillsScreen,
@@ -464,6 +465,7 @@ export default function App() {
       if (screen === "agents") data.refreshRunners();
       if (screen === "runners") data.refreshDashboard();
       if (screen === "channels") data.refreshChannels();
+      if (screen === "federation") data.refreshFederation();
       if (screen === "teams") {
         data.refreshTeams();
         data.refreshHumans();
@@ -666,6 +668,7 @@ export default function App() {
             agents={data.agents}
             runners={data.runners}
             skills={data.skills}
+            federationInstances={data.federationInstances}
             events={data.events}
             channels={data.channels}
             eventTypes={data.eventTypes}
@@ -708,6 +711,23 @@ export default function App() {
               data.refreshDashboard();
               data.refreshChannels();
               data.refreshProcesses();
+            }}
+            onCopyAgent={async (sourceName, input) => {
+              await data.apiFetch(`/api/agents/${encodeURIComponent(sourceName)}/copy`, {
+                method: "POST",
+                headers: data.getApiHeaders(),
+                body: JSON.stringify(input)
+              });
+              data.refreshDashboard();
+              data.refreshChannels();
+            }}
+            onMoveAgent={async (name, input) => {
+              await data.apiFetch(`/api/agents/${encodeURIComponent(name)}/move`, {
+                method: "POST",
+                headers: data.getApiHeaders(),
+                body: JSON.stringify(input)
+              });
+              data.refreshDashboard();
             }}
             onStartAgent={async (name) => {
               await data.apiFetch(`/api/agents/${name}/start`, { method: "POST" });
@@ -826,6 +846,7 @@ export default function App() {
           agents={data.agents}
           runners={data.runners}
           skills={data.skills}
+          federationInstances={data.federationInstances}
           onCreateAgent={async (agent) => {
             await data.apiFetch("/api/agents", {
               method: "POST",
@@ -851,6 +872,23 @@ export default function App() {
             data.refreshDashboard();
             data.refreshChannels();
             data.refreshProcesses();
+          }}
+          onCopyAgent={async (sourceName, input) => {
+            await data.apiFetch(`/api/agents/${encodeURIComponent(sourceName)}/copy`, {
+              method: "POST",
+              headers: data.getApiHeaders(),
+              body: JSON.stringify(input)
+            });
+            data.refreshDashboard();
+            data.refreshChannels();
+          }}
+          onMoveAgent={async (name, input) => {
+            await data.apiFetch(`/api/agents/${encodeURIComponent(name)}/move`, {
+              method: "POST",
+              headers: data.getApiHeaders(),
+              body: JSON.stringify(input)
+            });
+            data.refreshDashboard();
           }}
           onStartAgent={async (name) => {
             await data.apiFetch(`/api/agents/${name}/start`, { method: "POST" });
@@ -1100,6 +1138,117 @@ export default function App() {
               await data.loadChannelParticipants(channelId);
               await data.loadChannelEvents(channelId);
             }
+          }}
+        />
+      )}
+
+      {activeScreen === "federation" && (
+        <FederationScreen
+          instances={data.federationInstances}
+          channelLinks={data.federationChannels}
+          channels={data.channels}
+          onRefresh={async () => {
+            await data.refreshFederation();
+            await data.refreshChannels();
+          }}
+          onCreateInstance={async (input) => {
+            const response = await data.apiFetch("/api/federation/instances", {
+              method: "POST",
+              headers: data.getApiHeaders(),
+              body: JSON.stringify(input)
+            });
+            const created = (await response.json()) as {
+              id: string;
+              name: string;
+              baseUrl: string;
+              inboundToken?: string;
+              inboundTokenPrefix?: string;
+              hasOutboundToken?: boolean;
+              createdAt?: number;
+              updatedAt?: number;
+            };
+            return {
+              ...created,
+              createdAt: created.createdAt ?? Date.now(),
+              updatedAt: created.updatedAt ?? Date.now()
+            };
+          }}
+          onUpdateInstance={async (id, input) => {
+            await data.apiFetch(`/api/federation/instances/${encodeURIComponent(id)}`, {
+              method: "PATCH",
+              headers: data.getApiHeaders(),
+              body: JSON.stringify(input)
+            });
+          }}
+          onDeleteInstance={async (id) => {
+            await data.apiFetch(`/api/federation/instances/${encodeURIComponent(id)}`, {
+              method: "DELETE",
+              headers: data.getApiHeaders()
+            });
+            await data.refreshFederation();
+          }}
+          onCreateChannelLink={async (input) => {
+            await data.apiFetch("/api/federation/channels", {
+              method: "POST",
+              headers: data.getApiHeaders(),
+              body: JSON.stringify(input)
+            });
+          }}
+          onDeleteChannelLink={async (localChannelId, input) => {
+            const searchParams = new URLSearchParams();
+            if (input?.deleteLocalChannel) searchParams.set("deleteLocalChannel", "1");
+            const query = searchParams.toString();
+            await data.apiFetch(
+              `/api/federation/channels/${encodeURIComponent(localChannelId)}${
+                query ? `?${query}` : ""
+              }`,
+              {
+                method: "DELETE",
+                headers: data.getApiHeaders()
+              }
+            );
+            await data.refreshFederation();
+            await data.refreshChannels();
+          }}
+          onSyncChannel={async (localChannelId) => {
+            await data.apiFetch(
+              `/api/federation/channels/${encodeURIComponent(localChannelId)}/sync`,
+              {
+                method: "POST",
+                headers: data.getApiHeaders()
+              }
+            );
+          }}
+          onCreateJoinLink={async (localChannelId) => {
+            const response = await data.apiFetch(
+              `/api/federation/channels/${encodeURIComponent(localChannelId)}/join-link`,
+              {
+                method: "POST",
+                headers: data.getApiHeaders(),
+                body: JSON.stringify({})
+              }
+            );
+            return (await response.json()) as { joinUrl: string };
+          }}
+          onClearPendingJoinLinks={async (channelId) => {
+            const searchParams = new URLSearchParams();
+            if (channelId) searchParams.set("channelId", channelId);
+            const query = searchParams.toString();
+            const response = await data.apiFetch(`/api/federation/join-links${query ? `?${query}` : ""}`, {
+              method: "DELETE",
+              headers: data.getApiHeaders()
+            });
+            await data.refreshFederation();
+            return (await response.json()) as { deletedCount?: number };
+          }}
+          onJoinFromUrl={async (input) => {
+            await data.apiFetch("/api/federation/join", {
+              method: "POST",
+              headers: data.getApiHeaders(),
+              body: JSON.stringify(input)
+            });
+            await data.refreshFederation();
+            await data.refreshChannels();
           }}
         />
       )}

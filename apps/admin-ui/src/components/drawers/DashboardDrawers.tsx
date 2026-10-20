@@ -8,7 +8,8 @@ import type {
   ProcessOutputRow,
   ProcessRow,
   RunnerNode,
-  SkillMeta
+  SkillMeta,
+  FederationInstance
 } from "../../types";
 import { AgentsScreen, EventsScreen, ProcessesScreen } from "../../screens";
 
@@ -47,6 +48,7 @@ type DashboardDrawersProps = {
   agents: Agent[];
   runners: RunnerNode[];
   skills: SkillMeta[];
+  federationInstances?: FederationInstance[];
   events: EventRow[];
   channels: Channel[];
   eventTypes: EventTypeInfo[];
@@ -62,6 +64,19 @@ type DashboardDrawersProps = {
   onCreateAgent: (agent: AgentForm) => Promise<void>;
   onUpdateAgent: (name: string, agent: Omit<AgentForm, "name">) => Promise<void>;
   onDeleteAgent: (name: string) => Promise<void>;
+  onCopyAgent: (
+    sourceName: string,
+    input: {
+      name: string;
+      assignedRunnerId?: string | null;
+      copyChannelMemberships?: boolean;
+      federationInstanceId?: string;
+    }
+  ) => Promise<void>;
+  onMoveAgent: (
+    name: string,
+    input: { assignedRunnerId?: string | null; federationInstanceId?: string; name?: string }
+  ) => Promise<void>;
   onStartAgent: (name: string) => Promise<void>;
   onStopAgent: (name: string) => Promise<void>;
   onCleanupAgentWorkspace: (name: string) => Promise<void>;
@@ -109,6 +124,7 @@ export function DashboardDrawers({
   agents,
   runners,
   skills,
+  federationInstances = [],
   events,
   channels,
   eventTypes,
@@ -124,6 +140,8 @@ export function DashboardDrawers({
   onCreateAgent,
   onUpdateAgent,
   onDeleteAgent,
+  onCopyAgent,
+  onMoveAgent,
   onStartAgent,
   onStopAgent,
   onCleanupAgentWorkspace,
@@ -152,9 +170,12 @@ export function DashboardDrawers({
         agents={agents}
         runners={runners}
         skills={skills}
+        federationInstances={federationInstances}
         onCreateAgent={onCreateAgent}
         onUpdateAgent={onUpdateAgent}
         onDeleteAgent={onDeleteAgent}
+        onCopyAgent={onCopyAgent}
+        onMoveAgent={onMoveAgent}
         onStartAgent={onStartAgent}
         onStopAgent={onStopAgent}
         onCleanupAgentWorkspace={onCleanupAgentWorkspace}

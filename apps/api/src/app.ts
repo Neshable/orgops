@@ -1,4 +1,7 @@
-import { registerGoogleAuthRoutes, type HumanSession } from './routes/google-auth';
+import {
+  registerGoogleAuthRoutes,
+  type HumanSession,
+} from "./routes/google-auth";
 import { Hono } from "hono";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { mkdirSync } from "node:fs";
@@ -37,6 +40,7 @@ import {
 } from "@orgops/skills";
 import { registerAuthRoutes } from "./routes/auth";
 import { registerModelsRoutes } from "./routes/models";
+import { createAgentTransfer, type AgentTransferBundle } from "./agent-transfer";
 import { registerAgentsRoutes } from "./routes/agents";
 import { registerCollabRoutes } from "./routes/collab";
 import { registerEventsRoutes } from "./routes/events";
@@ -50,6 +54,7 @@ import { registerRunnersRoutes } from "./routes/runners";
 import { registerIntegrationKeysRoutes } from "./routes/integration-keys";
 import { registerEmbedRoutes } from "./routes/embed";
 import { registerBillingRoutes } from "./routes/billing";
+import { registerFederationRoutes } from "./routes/federation";
 import {
   findActiveRunnerTokenByToken,
   parseStringArraySafe as parseRunnerScopeChannels,
@@ -224,8 +229,14 @@ export function createApp(config: AppConfig = {}) {
       runnerScope: {
         mode,
         tokenId: scoped.id,
-        allowedAgentName: mode === "SCOPED" ? scoped.allowed_agent_name ?? undefined : undefined,
-        allowedRunnerId: mode === "SCOPED" ? scoped.allowed_runner_id ?? undefined : undefined,
+        allowedAgentName:
+          mode === "SCOPED"
+            ? (scoped.allowed_agent_name ?? undefined)
+            : undefined,
+        allowedRunnerId:
+          mode === "SCOPED"
+            ? (scoped.allowed_runner_id ?? undefined)
+            : undefined,
         allowedChannelIds:
           mode === "SCOPED"
             ? parseRunnerScopeChannels(scoped.allowed_channel_ids_json)
@@ -325,6 +336,84 @@ export function createApp(config: AppConfig = {}) {
     }
   }
 
+  async function pushFederatedEvent(row: any) {
+    const channelId = typeof row.channel_id === "string" ? row.channel_id : "";
+    if (!channelId) return;
+    let subscribers: any[];
+    try {
+      subscribers = orm
+        .select()
+        .from(schema.federationChannelSubscribers)
+        .where(eq(schema.federationChannelSubscribers.local_channel_id, channelId))
+        .all() as any[];
+    } catch (error) {
+      if (String(error).includes("no such table: federation_channel_subscribers")) return;
+      throw error;
+    }
+    if (subscribers.length === 0) return;
+    const event = eventRowToApi(row);
+    for (const subscriber of subscribers) {
+      const instance = orm
+        .select()
+        .from(schema.federationInstances)
+        .where(eq(schema.federationInstances.id, subscriber.instance_id))
+        .get() as any;
+      const now = Date.now();
+      if (!instance?.outbound_token || !instance?.base_url) {
+        orm
+          .update(schema.federationChannelSubscribers)
+          .set({
+            last_push_at: now,
+            last_error: "Missing outbound federation token or base URL",
+            updated_at: now,
+          })
+          .where(eq(schema.federationChannelSubscribers.id, subscriber.id))
+          .run();
+        continue;
+      }
+      try {
+        const baseUrl = String(instance.base_url).replace(/\/+$/, "");
+        const response = await fetch(
+          `${baseUrl}/api/federation/projections/${encodeURIComponent(
+            subscriber.remote_channel_id,
+          )}/events`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${String(instance.outbound_token).trim()}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify(event),
+          },
+        );
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`${response.status} ${text}`);
+        }
+        orm
+          .update(schema.federationChannelSubscribers)
+          .set({
+            last_push_at: now,
+            last_ack_at: Date.now(),
+            last_error: null,
+            updated_at: Date.now(),
+          })
+          .where(eq(schema.federationChannelSubscribers.id, subscriber.id))
+          .run();
+      } catch (error) {
+        orm
+          .update(schema.federationChannelSubscribers)
+          .set({
+            last_push_at: now,
+            last_error: error instanceof Error ? error.message : String(error),
+            updated_at: Date.now(),
+          })
+          .where(eq(schema.federationChannelSubscribers.id, subscriber.id))
+          .run();
+      }
+    }
+  }
+
   function publishProcessOutput(processId: string, payload: any) {
     bus.publish(`process:${processId}`, {
       type: "process_output",
@@ -411,15 +500,24 @@ export function createApp(config: AppConfig = {}) {
         .run();
     }
     publishEvent(row);
+    void pushFederatedEvent(row);
     return row;
   }
 
   const access = createAccessControl({ orm });
 
-  registerGoogleAuthRoutes(app as any, {db, sessions, hashPassword, requireAuth});
+  registerGoogleAuthRoutes(app as any, {
+    db,
+    sessions,
+    hashPassword,
+    requireAuth,
+  });
 
   registerAuthRoutes(app as any, {
-    isGoogleHuman: (id) => Boolean(db.prepare("SELECT 1 FROM human_identities WHERE human_id=?").get(id)),
+    isGoogleHuman: (id) =>
+      Boolean(
+        db.prepare("SELECT 1 FROM human_identities WHERE human_id=?").get(id),
+      ),
     orm,
     humanSchema: schema.humans,
     RUNNER_TOKEN,
@@ -448,6 +546,46 @@ export function createApp(config: AppConfig = {}) {
 
   registerModelsRoutes(app as any, { orm, jsonResponse, parseJson });
 
+  const agentTransfer = createAgentTransfer({
+    orm,
+    skillRoots: SKILL_ROOTS,
+    resolveWorkspacePath,
+    parseStringArraySafe,
+  });
+
+  async function transferToPeer(instanceId: string, bundle: AgentTransferBundle) {
+    const instance = orm
+      .select()
+      .from(schema.federationInstances)
+      .where(eq(schema.federationInstances.id, instanceId))
+      .get() as { base_url?: string | null; outbound_token?: string | null; name?: string } | undefined;
+    if (!instance) throw new Error("Federation peer not found");
+    const token = String(instance.outbound_token ?? "").trim();
+    const baseUrl = String(instance.base_url ?? "").replace(/\/+$/, "");
+    if (!token || !baseUrl) {
+      throw new Error(`Federation peer "${instance.name ?? instanceId}" is missing a base URL or outbound token.`);
+    }
+    const response = await fetch(`${baseUrl}/api/federation/agents/transfer`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(bundle),
+    });
+    const text = await response.text();
+    let parsed: any = {};
+    try {
+      parsed = text ? JSON.parse(text) : {};
+    } catch {
+      parsed = { error: text };
+    }
+    if (!response.ok) {
+      throw new Error(parsed?.error || `Federation request failed: ${response.status}`);
+    }
+    return parsed;
+  }
+
   registerAgentsRoutes(app as any, {
     orm,
     bus,
@@ -457,6 +595,8 @@ export function createApp(config: AppConfig = {}) {
     resolveWorkspacePath,
     insertEvent,
     access,
+    agentTransfer,
+    transferToPeer,
   });
 
   registerCollabRoutes(app as any, { orm, jsonResponse, access });
@@ -534,6 +674,15 @@ export function createApp(config: AppConfig = {}) {
     requireRunnerAuth,
     runnerToken: RUNNER_TOKEN,
     runnerApiUrl: RUNNER_API_URL,
+  });
+
+  registerFederationRoutes(app as any, {
+    orm,
+    jsonResponse,
+    requireAuth,
+    insertEvent,
+    eventRowToApi,
+    agentTransfer,
   });
 
   registerIntegrationKeysRoutes(app as any, { orm, jsonResponse, access });

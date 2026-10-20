@@ -170,6 +170,18 @@ Stored in `runner_nodes`:
 
 Runner IDs are stable across restarts by persisting local `.agent-runner-id`.
 
+### Federation
+
+Federation is modeled around hoisted channels. A shared channel has one canonical
+home OrgOps instance; other instances may keep local projection channels for UI
+and runner compatibility. `federation_instances` stores known peer instances,
+their base URL, an optional outbound bearer token for calls to that peer, and a
+hashed inbound bearer token for calls from that peer. `federation_channels`
+links a local channel to either a `LOCAL_HOME` role or a `REMOTE_PROJECTION`
+role with `home_instance_id`, `remote_channel_id`, and a pull `sync_cursor`.
+Projection rows are caches/convenience records; the home instance is the source
+of truth for ordering and policy.
+
 ### Collaboration
 
 - `humans`: login users, password hash, `must_change_password`, inviter metadata
@@ -390,6 +402,12 @@ Published topics include:
 - supports `GET /api/agents?assignedRunnerId=<runnerId>&includeUnassigned=1`
 - `POST /api/agents/:name/:action` where action is one of:
   - `start`, `stop`, `restart`, `reload-skills`, `cleanup-workspace`
+- agent management utilities:
+  - `GET /api/agents/:name/transfer` exports an agent bundle: configuration, workspace files, enabled skill files, private secrets, and memory
+  - `POST /api/agents/:name/copy` clones the agent. Enabled and always-preloaded skills are copied. Workspace files are copied. Private secrets are copied only when the destination does not already have the same name as a public or package secret. Skill directories are written under the new workspace only when that skill name is not already in the repo skill catalog. Channel and cross-channel memory summaries are copied. Channel memory is attached to the same channel id, or to a destination channel with the same name. Processes are not copied.  Optional `federationInstanceId` copies the bundle onto that peer instead of creating a local agent
+  - `POST /api/agents/:name/move` reassigns `assignedRunnerId` on this instance, keeps the workspace path, and stops running or starting processes. Optional `federationInstanceId` sends the same bundle, including memory, to that peer, stops local processes, and then deletes the local agent. `name` sets the destination agent name
+  - peers accept `GET|POST /api/federation/agents/transfer` with the peer bearer token
+  - humans call these routes from the admin UI; agents call `agents_copy` and `agents_move`
 - debug endpoint:
   - `GET /api/agents/:name/debug/system-prompt`
 - workspace browser endpoints:
@@ -490,6 +508,59 @@ Published topics include:
 - `DELETE /api/runners/:id` (also unassigns pinned agents from deleted runner)
 - scoped runner tokens must register/heartbeat only the runner ID bound into their scope
 
+### Federation
+
+- `GET /api/federation/instances`
+- `POST /api/federation/instances`
+  - returns a one-time `inboundToken` to configure as the peer's outbound token
+- `PATCH /api/federation/instances/:id`
+- `DELETE /api/federation/instances/:id`
+  - removes a peer record and its federation subscribers/projection links
+- `GET /api/federation/channels`
+- `POST /api/federation/channels`
+  - `role=LOCAL_HOME` marks a local channel as canonical for federation
+  - `role=REMOTE_PROJECTION` creates or links a local projection to a home instance/channel
+- `DELETE /api/federation/channels/:localChannelId`
+  - removes the federation link; `?deleteLocalChannel=1` also deletes a `REMOTE_PROJECTION` local channel
+- simplified join flow:
+  - `POST /api/federation/channels/:channelId/join-link` creates a one-time-ish join URL for a `LOCAL_HOME` channel
+  - `POST /api/federation/join` accepts a pasted join URL plus the peer's public base URL, then creates the peer record, projection channel, and webhook subscription
+  - `DELETE /api/federation/join-links` clears pending join URLs, with optional `?channelId=<id>`
+- federation bearer-token endpoints:
+  - `GET /api/federation/channels/:channelId/events?after=<cursor>` exposes canonical home-channel events to peers
+  - `POST /api/federation/channels/:channelId/events` accepts a peer-authenticated write into the canonical home channel
+  - `POST /api/federation/channels/:channelId/subscribers` registers a remote projection webhook subscriber
+  - `POST /api/federation/projections/:localChannelId/events` accepts pushed canonical events into a projection channel
+- projection sync:
+  - `POST /api/federation/channels/:localChannelId/sync` pulls canonical home events into a local projection channel, using idempotency keys shaped as `federation:<homeInstanceId>:<remoteEventId>`
+
+When a user or local agent posts to a `REMOTE_PROJECTION` channel through
+`POST /api/events`, the API validates the event locally, forwards the write to
+the home instance, then stores the canonical event as a local projection event.
+Projection events create ordinary local receipts so local runners can keep their
+existing polling behavior. The home instance remains authoritative for channel
+ordering. The API also runs a lightweight projection sync loop every
+`ORGOPS_FEDERATION_SYNC_INTERVAL_MS` milliseconds (default `15000`; set `0` to
+disable) and the UI exposes a manual sync button for retry/diagnostics. For
+realtime delivery, remote projections register a webhook subscription with the
+home channel. When the home API inserts a canonical event, it pushes the event
+to subscribed projection instances; successful acks update `lastAckAt`, while
+failures update `lastError` and rely on the pull sync loop for repair.
+
+Chained federation is deliberately not enabled in this version. A local channel
+has one federation role (`LOCAL_HOME` or `REMOTE_PROJECTION`) so a channel cannot
+simultaneously be a canonical home and a projection of another home. This avoids
+multi-hop loops, ambiguous ordering, and hard-to-explain access policy. If
+multi-hop federation becomes necessary, model it explicitly as a DAG with an
+origin instance/event ID, hop limits, and per-link policy rather than making every
+projection silently re-host downstream.
+
+Operator UX: on the home instance, mark a channel `LOCAL_HOME` and copy its join
+URL from the Federation screen. On the peer instance, paste that URL into
+"Join From URL" and provide the peer's public base URL. The peer stores the home
+token for outbound writes/sync and registers its own inbound token with the home
+so realtime webhook push works without manually configuring reverse credentials.
+
 ## Agent Runner Behavior
 
 Runner loop:
@@ -501,6 +572,7 @@ Runner loop:
    - ensure workspace exists
    - heartbeat runtime state to API
    - emit one-time lifecycle bootstrap event (`agent.lifecycle.started`) for native modes, or run wrapped lifecycle setup for `WRAPPED`
+   - if the API marks the agent `runtime_state=STARTING`, clear the runner bootstrap marker and re-run startup/setup; wrapped runtimes are stopped first so refreshed secret env is injected into new sidecars/setup
 5. Pull pending events with per-agent receipt semantics.
 6. Filter control/audit/self-authored/agent-authored events.
 7. Group remaining pending events by channel and process each channel as a single handling batch.
@@ -605,6 +677,7 @@ Security note: wrapped `source`, `setup.command`, and `runtime.command` are host
 - `ORGOPS_COOKIE_SECURE`
 - `ORGOPS_EVENT_MAX_FAILURES`
 - `ORGOPS_EVENT_SHAPES_CACHE_TTL_MS`
+- `ORGOPS_FEDERATION_SYNC_INTERVAL_MS`
 - `ORGOPS_RUNNER_ONLINE_THRESHOLD_MS`
 - `ORGOPS_PROJECT_ROOT`
 - `ORGOPS_SKILL_ROOTS` (optional comma-separated additional skill roots; repo `skills/` remains first)

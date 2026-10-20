@@ -7,6 +7,8 @@ import type {
   ChannelParticipant,
   EventRow,
   EventTypeInfo,
+  FederationChannelLink,
+  FederationInstance,
   Human,
   ProcessRow,
   ProcessOutputRow,
@@ -58,6 +60,8 @@ export function useOrgOpsData(authenticated: boolean) {
   const [secrets, setSecrets] = useState<SecretRow[]>([]);
   const [integrationKeys, setIntegrationKeys] = useState<IntegrationKey[]>([]);
   const [agentInvites, setAgentInvites] = useState<AgentInvite[]>([]);
+  const [federationInstances, setFederationInstances] = useState<FederationInstance[]>([]);
+  const [federationChannels, setFederationChannels] = useState<FederationChannelLink[]>([]);
   const [channelEvents, setChannelEvents] = useState<EventRow[]>([]);
   const [channelParticipants, setChannelParticipants] = useState<
     ChannelParticipant[]
@@ -143,6 +147,14 @@ export function useOrgOpsData(authenticated: boolean) {
     () => apiJson<AgentInvite[]>("/api/agent-invites").then(setAgentInvites),
     [],
   );
+  const refreshFederation = useCallback(async () => {
+    const [instances, channels] = await Promise.all([
+      apiJson<FederationInstance[]>("/api/federation/instances"),
+      apiJson<FederationChannelLink[]>("/api/federation/channels"),
+    ]);
+    setFederationInstances(instances);
+    setFederationChannels(channels);
+  }, []);
 
   useEffect(() => {
     if (!authenticated) return;
@@ -156,6 +168,7 @@ export function useOrgOpsData(authenticated: boolean) {
     refreshSecrets();
     refreshIntegrationKeys();
     refreshAgentInvites();
+    refreshFederation();
     refreshTeams();
     refreshHumans();
   }, [
@@ -170,6 +183,7 @@ export function useOrgOpsData(authenticated: boolean) {
     refreshSecrets,
     refreshIntegrationKeys,
     refreshAgentInvites,
+    refreshFederation,
     refreshTeams,
     refreshHumans,
   ]);
@@ -202,10 +216,11 @@ export function useOrgOpsData(authenticated: boolean) {
 
   const loadChannelEvents = useCallback(async (channelId: string) => {
     const data = await apiJson<EventRow[]>(
-      `/api/events?channelId=${channelId}&limit=200`,
+      `/api/events?channelId=${encodeURIComponent(channelId)}&limit=200&order=desc`,
     );
-    setChannelEvents(data);
-    return data;
+    const chronological = data.slice().reverse();
+    setChannelEvents(chronological);
+    return chronological;
   }, []);
 
   const loadChannelParticipants = useCallback(async (channelId: string) => {
@@ -244,6 +259,10 @@ export function useOrgOpsData(authenticated: boolean) {
     setIntegrationKeys,
     agentInvites,
     setAgentInvites,
+    federationInstances,
+    setFederationInstances,
+    federationChannels,
+    setFederationChannels,
     refreshDashboard,
     refreshSkills,
     refreshEvents,
@@ -258,6 +277,7 @@ export function useOrgOpsData(authenticated: boolean) {
     refreshSecrets,
     refreshIntegrationKeys,
     refreshAgentInvites,
+    refreshFederation,
     channelEvents,
     channelParticipants,
     dashboardEventStats,
