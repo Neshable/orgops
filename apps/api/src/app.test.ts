@@ -7,10 +7,10 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { decryptSecret, parseMasterKey } from "@orgops/crypto";
 import { createDrizzleDb, migrate, openDb, schema } from "@orgops/db";
@@ -266,6 +266,202 @@ describe("api app", () => {
       if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
     }
+  });
+
+  it("publishes workspace folders through direct-local and snapshot revisions", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+    const workspaceDir = join(dataDir, "workspace-publication-agent");
+    mkdirSync(join(workspaceDir, "dist"), { recursive: true });
+    writeFileSync(join(workspaceDir, "dist", "index.html"), "<h1>direct</h1>", "utf-8");
+    const db = openDb(":memory:");
+    const { app } = createApp({
+      db,
+      dataDir,
+      adminUser: "admin",
+      adminPass: "admin",
+    });
+    const loginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "admin" }),
+    });
+    const cookie = loginRes.headers.get("set-cookie") ?? "";
+
+    const runnerRegisterRes = await app.request("http://localhost/api/runners/register", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-orgops-runner-token": "dev-runner-token",
+      },
+      body: JSON.stringify({
+        displayName: "local-runner",
+        hostname: hostname(),
+        platform: process.platform,
+        arch: process.arch,
+      }),
+    });
+    expect(runnerRegisterRes.status).toBe(201);
+    const runnerPayload = (await runnerRegisterRes.json()) as { runner?: { id?: string } };
+    const localRunnerId = runnerPayload.runner?.id ?? "";
+
+    const agentRes = await app.request("http://localhost/api/agents", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        name: "workspace-publisher",
+        modelId: "openai:gpt-4o-mini",
+        workspacePath: workspaceDir,
+        assignedRunnerId: localRunnerId,
+      }),
+    });
+    expect(agentRes.status).toBe(201);
+
+    const directRes = await app.request(
+      "http://localhost/api/agents/workspace-publisher/publications",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie },
+        body: JSON.stringify({
+          publicPath: "/preview/workspace-publisher/",
+          sourcePath: "dist",
+        }),
+      },
+    );
+    expect(directRes.status).toBe(201);
+    const directPublication = (await directRes.json()) as { syncMode?: string; publicPath?: string };
+    expect(directPublication.syncMode).toBe("DIRECT_LOCAL");
+    expect(directPublication.publicPath).toBe("/preview/workspace-publisher/");
+    const directPublic = await app.request("http://localhost/preview/workspace-publisher/");
+    expect(directPublic.status).toBe(200);
+    expect(await directPublic.text()).toBe("<h1>direct</h1>");
+
+    const rootPublishRes = await app.request(
+      "http://localhost/api/agents/workspace-publisher/publications",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie },
+        body: JSON.stringify({
+          publicPath: "/agents/root-blocked/dist/",
+          sourcePath: ".",
+        }),
+      },
+    );
+    expect(rootPublishRes.status).toBe(400);
+
+    const snapshotAgentRes = await app.request("http://localhost/api/agents", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        name: "snapshot-publisher",
+        modelId: "openai:gpt-4o-mini",
+        workspacePath: join(dataDir, "snapshot-workspace"),
+        assignedRunnerId: "remote-runner",
+      }),
+    });
+    expect(snapshotAgentRes.status).toBe(201);
+
+    const snapshotRes = await app.request(
+      "http://localhost/api/agents/snapshot-publisher/publications",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie },
+        body: JSON.stringify({
+          publicPath: "/agents/snapshot-publisher/dist/",
+          sourcePath: "dist",
+          authType: "PASSWORD",
+          password: "publish-pass",
+        }),
+      },
+    );
+    expect(snapshotRes.status).toBe(201);
+    const snapshotPublication = (await snapshotRes.json()) as { id: string; syncMode?: string };
+    expect(snapshotPublication.syncMode).toBe("SNAPSHOT");
+
+    const syncRes = await app.request(
+      "http://localhost/api/workspace-publications/sync?runnerId=remote-runner",
+      { headers: { "x-orgops-runner-token": "dev-runner-token" } },
+    );
+    expect(syncRes.status).toBe(200);
+    const syncPayload = (await syncRes.json()) as { publications: Array<{ id: string }> };
+    expect(syncPayload.publications.some((publication) => publication.id === snapshotPublication.id)).toBe(
+      true,
+    );
+
+    const bytes = Buffer.from("<h1>snapshot</h1>", "utf-8");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const files = [{ path: "index.html", sha256, size: bytes.byteLength, mime: "text/html" }];
+    const missingRes = await app.request(
+      `http://localhost/api/workspace-publications/${snapshotPublication.id}/blobs/missing`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-orgops-runner-token": "dev-runner-token",
+        },
+        body: JSON.stringify({ files }),
+      },
+    );
+    expect(missingRes.status).toBe(200);
+    expect(await missingRes.json()).toEqual({ missing: [sha256] });
+
+    const blobRes = await app.request(
+      `http://localhost/api/workspace-publications/${snapshotPublication.id}/blobs/${sha256}`,
+      {
+        method: "PUT",
+        headers: { "x-orgops-runner-token": "dev-runner-token" },
+        body: bytes,
+      },
+    );
+    expect(blobRes.status).toBe(200);
+
+    const revisionRes = await app.request(
+      `http://localhost/api/workspace-publications/${snapshotPublication.id}/revisions`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-orgops-runner-token": "dev-runner-token",
+        },
+        body: JSON.stringify({ files, createdByAgentName: "snapshot-publisher" }),
+      },
+    );
+    expect(revisionRes.status).toBe(200);
+
+    const unauthenticatedPublic = await app.request(
+      "http://localhost/agents/snapshot-publisher/dist/",
+    );
+    expect(unauthenticatedPublic.status).toBe(200);
+    expect(await unauthenticatedPublic.text()).toContain("This published folder is password protected.");
+    const wrongPassword = await app.request("http://localhost/agents/snapshot-publisher/dist/", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ password: "wrong" }).toString(),
+    });
+    expect(wrongPassword.status).toBe(401);
+    const formLogin = await app.request("http://localhost/agents/snapshot-publisher/dist/", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ password: "publish-pass" }).toString(),
+    });
+    expect(formLogin.status).toBe(303);
+    const authCookie = formLogin.headers.get("set-cookie") ?? "";
+    const cookiePublic = await app.request("http://localhost/agents/snapshot-publisher/dist/", {
+      headers: { cookie: authCookie },
+    });
+    expect(cookiePublic.status).toBe(200);
+    expect(await cookiePublic.text()).toBe("<h1>snapshot</h1>");
+    const authenticatedPublic = await app.request(
+      "http://localhost/agents/snapshot-publisher/dist/",
+      {
+        headers: {
+          authorization: `Basic ${Buffer.from("viewer:publish-pass").toString("base64")}`,
+        },
+      },
+    );
+    expect(authenticatedPublic.status).toBe(200);
+    expect(await authenticatedPublic.text()).toBe("<h1>snapshot</h1>");
+
+    rmSync(dataDir, { recursive: true, force: true });
   });
 
   it("registers runners and filters agents by assigned runner", async () => {

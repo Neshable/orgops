@@ -206,6 +206,8 @@ of truth for ordering and policy.
 
 - `processes` (includes `execution_mode` and process state fields), `process_output`
 - `files`
+- `workspace_publications` — explicitly published agent workspace subfolders exposed at configurable public paths such as `/agents/<name>/<subfolder>/`
+- `workspace_publication_blobs` and `workspace_publication_revisions` — content-addressed snapshot storage and atomic manifests for runner-synced publications
 - `secrets`
 - `models`
 - `llm_model_prices`: provider/model price snapshots with source URL and effective time; OpenAI/Anthropic seed from curated docs, OpenRouter can refresh from its models API
@@ -414,6 +416,18 @@ Published topics include:
   - `GET /api/agents/:name/workspace`
   - `GET /api/agents/:name/workspace/file`
   - `GET /api/agents/:name/workspace/download`
+- workspace publication management:
+  - `GET /api/agents/:name/publications`
+  - `POST /api/agents/:name/publications`
+    - accepts `publicPath`, `sourcePath`, optional `slug`, `title`, `enabled`, `authType` (`PUBLIC` or `PASSWORD`), and optional `password`
+    - `sourcePath` must name a workspace subfolder; publishing the workspace root is rejected
+    - serving mode is selected automatically: `DIRECT_LOCAL` when the assigned runner hostname matches the API host, otherwise `SNAPSHOT`
+  - `PATCH /api/workspace-publications/:id`
+  - `DELETE /api/workspace-publications/:id`
+- public workspace publications:
+  - `GET <publication.publicPath>...` (for example `/agents/system/dist/`)
+  - legacy `GET /agents/:name/:slug/...` remains accepted for publication rows
+  - password-protected publications use HTTP Basic auth in this version
 
 ### Teams / Channels / Conversations
 
@@ -614,6 +628,26 @@ Current tool families exposed to models:
   - `events_channels_list`, `events_event_types`, `events_scheduled_create`, `events_schedule_self`
 - agent management helpers:
   - `agents_search`, `agents_create`
+  - `agents_publish_workspace`, `agents_unpublish_workspace`, `agents_list_publications`
+
+### Workspace Publications
+
+Agents can publish explicit subfolders from their workspace to unauthenticated web URLs. Publications are configured from the admin UI or by agent tools. The human-facing mount is `publicPath`, defaulting in the UI to `/agents/<agent-name>/<subfolder>/`, and operators may set another non-reserved absolute path such as `/sites/report/`. The internal `slug` remains unique per agent for management compatibility.
+
+Two serving modes are supported:
+
+- `DIRECT_LOCAL` serves from the live workspace filesystem. It is selected automatically when the assigned runner hostname matches the API host.
+- `SNAPSHOT` is selected when the assigned runner is elsewhere or unknown. The assigned runner scans enabled publication folders on a short interval, hashes files, uploads missing content-addressed blobs to the API, then commits an atomic revision manifest. The API serves public traffic from the latest complete revision, so internet requests do not depend on live runner availability.
+
+Runner sync endpoints are runner-authenticated:
+
+- `GET /api/workspace-publications/sync?runnerId=<id>` returns enabled snapshot publications for agents assigned to the runner.
+- `POST /api/workspace-publications/:id/blobs/missing` returns hashes the API does not already store.
+- `PUT /api/workspace-publications/:id/blobs/:sha256` uploads one blob and verifies the SHA-256.
+- `POST /api/workspace-publications/:id/revisions` commits the manifest as the active revision.
+- `POST /api/workspace-publications/:id/sync-error` records sync diagnostics.
+
+Snapshot sync skips common secret/control paths such as dotfiles, `.env*`, VCS directories, and `node_modules`, enforces per-file size limits, and rejects symlink escapes. Passwords are stored with the same scrypt hashing helper used for human passwords; plaintext publication passwords are never stored. Publishing the root workspace folder is rejected; create a subfolder such as `dist`, `public`, or `site` and publish that.
 
 Audit events are emitted around tool/process operations and RLM execution.
 
@@ -658,7 +692,7 @@ Security note: wrapped `source`, `setup.command`, and `runtime.command` are host
 - Root `Dockerfile` builds a single reusable image containing `api`, `agent-runner`, `admin-ui`, and `user-ui`.
 - `docker/entrypoint.sh` supports runtime component selection through `ORGOPS_COMPONENTS` (CSV of `api`, `runner`, `admin-ui`, `user-ui`).
 - When any HTTP-serving component is enabled, HAProxy runs in-container as the public listener (default port `8787`) and routes:
-  - `/api`, `/ws`, `/health` -> API backend
+  - `/api`, `/agents`, `/agent`, `/ws`, `/health` -> API backend
   - `/admin` -> admin UI preview backend
   - `/` -> user UI preview backend (fallback order: user UI -> admin UI -> API)
 - Runner startup waits for local API readiness only when both `api` and `runner` are enabled in the same container.
@@ -690,6 +724,7 @@ Security note: wrapped `source`, `setup.command`, and `runtime.command` are host
 - `ORGOPS_CROSS_FULL_MEMORY_INTERVAL_MS`
 - `ORGOPS_AGENT_INTENT_TIMEOUT_MS`
 - `ORGOPS_AGENT_INTENT_MAX_TIMEOUTS`
+- `ORGOPS_WORKSPACE_PUBLICATION_SYNC_INTERVAL_MS`
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`
   - for native/wrapped runtime execution with injected env, provider keys are loaded from resolved secrets and do not fall back to host process env
   - when the default `system` agent is seeded, the matching key is copied into a public secret so the runner can inject it

@@ -16,6 +16,8 @@ export default defineConfig({
     port: 5190,
     proxy: {
       "/api": apiProxyTarget,
+      "/agents": apiProxyTarget,
+      "/agent": apiProxyTarget,
       "/ws": {
         target: wsProxyTarget,
         ws: true

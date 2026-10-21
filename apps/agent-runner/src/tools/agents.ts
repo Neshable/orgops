@@ -45,6 +45,30 @@ const agentsMoveSchema = z
     }
   });
 
+const publicationAuthTypeSchema = z.enum(["PUBLIC", "PASSWORD"]);
+
+const agentsPublishWorkspaceSchema = z.object({
+  agentName: z.string().min(1).optional(),
+  slug: z.string().min(1).optional(),
+  publicPath: z.string().min(1).optional(),
+  sourcePath: z.string().min(1).optional(),
+  title: z.string().optional(),
+  enabled: z.boolean().optional(),
+  authType: publicationAuthTypeSchema.optional(),
+  password: z.string().optional(),
+});
+
+const agentsUnpublishWorkspaceSchema = z.object({
+  publicationId: z.string().min(1).optional(),
+  agentName: z.string().min(1).optional(),
+  slug: z.string().min(1).optional(),
+  publicPath: z.string().min(1).optional(),
+});
+
+const agentsListPublicationsSchema = z.object({
+  agentName: z.string().min(1).optional(),
+});
+
 const agentsCreateSchema = z.object({
   name: z.string().min(1),
   icon: z.string().optional(),
@@ -140,6 +164,21 @@ export const agentsToolDefs: ToolDef[] = [
     agentsMoveSchema,
   ],
   [
+    "agents_publish_workspace",
+    "Publish an agent workspace subfolder at a public URL path such as /agents/<agentName>/<subfolder>/. Re-running with the same publicPath updates that publication. Serving mode is selected automatically from runner/API placement.",
+    agentsPublishWorkspaceSchema,
+  ],
+  [
+    "agents_unpublish_workspace",
+    "Delete a workspace publication by publicationId, or by agentName plus publicPath/slug. Defaults agentName to the current agent when omitted.",
+    agentsUnpublishWorkspaceSchema,
+  ],
+  [
+    "agents_list_publications",
+    "List workspace publications for an agent. Defaults to the current agent when agentName is omitted.",
+    agentsListPublicationsSchema,
+  ],
+  [
     "agents_update",
     "Update an existing OrgOps agent via the agent API. Use wrappedConfig for object input or wrappedConfigJson for a JSON string when patching wrapped runtime config.",
     agentsUpdateSchema,
@@ -192,6 +231,11 @@ function parseWrappedConfigJson(value: string): Record<string, unknown> {
     throw new Error("wrappedConfigJson must parse to a JSON object.");
   }
   return parsed as Record<string, unknown>;
+}
+
+function normalizePublicPathInput(value: string) {
+  const withLeadingSlash = value.startsWith("/") ? value : `/${value}`;
+  return withLeadingSlash.endsWith("/") ? withLeadingSlash : `${withLeadingSlash}/`;
 }
 
 export async function execute(
@@ -280,6 +324,117 @@ export async function execute(
     );
     const moved = await parseResponseBody(response);
     return { ok: true, agentName, moved };
+  }
+
+  if (tool === "agents_list_publications") {
+    const parsedResult = parseToolArgs(tool, agentsListPublicationsSchema, args);
+    if (!parsedResult.ok) return { error: parsedResult.error };
+    const agentName = trimOptional(parsedResult.data.agentName) ?? ctx.agent.name;
+    const response = await ctx.apiFetch(
+      `/api/agents/${encodeURIComponent(agentName)}/publications`,
+      {
+        headers: { "x-orgops-agent-name": ctx.agent.name },
+      },
+    );
+    const publications = await parseResponseBody(response);
+    return { ok: true, agentName, publications };
+  }
+
+  if (tool === "agents_publish_workspace") {
+    const parsedResult = parseToolArgs(tool, agentsPublishWorkspaceSchema, args);
+    if (!parsedResult.ok) return { error: parsedResult.error };
+    const parsed = parsedResult.data;
+    const agentName = trimOptional(parsed.agentName) ?? ctx.agent.name;
+    const publicPath = normalizePublicPathInput(
+      trimOptional(parsed.publicPath) ?? `/agents/${agentName}/site/`,
+    );
+    const slug = trimOptional(parsed.slug)?.toLowerCase();
+    const listResponse = await ctx.apiFetch(
+      `/api/agents/${encodeURIComponent(agentName)}/publications`,
+      {
+        headers: { "x-orgops-agent-name": ctx.agent.name },
+      },
+    );
+    const existingList = (await parseResponseBody(listResponse)) as Array<{
+      id?: string;
+      slug?: string;
+      publicPath?: string;
+    }>;
+    const existing = Array.isArray(existingList)
+      ? existingList.find(
+          (publication) =>
+            publication.publicPath === publicPath || (slug && publication.slug === slug),
+        )
+      : undefined;
+    const body: Record<string, unknown> = {
+      ...(slug ? { slug } : {}),
+      publicPath,
+      sourcePath: trimOptional(parsed.sourcePath) ?? "dist",
+      ...(parsed.title !== undefined ? { title: parsed.title } : {}),
+      ...(parsed.enabled !== undefined ? { enabled: parsed.enabled } : {}),
+      ...(parsed.authType !== undefined ? { authType: parsed.authType } : {}),
+      ...(parsed.password !== undefined ? { password: parsed.password } : {}),
+    };
+    const response = existing?.id
+      ? await ctx.apiFetch(`/api/workspace-publications/${encodeURIComponent(existing.id)}`, {
+          method: "PATCH",
+          headers: {
+            "content-type": "application/json",
+            "x-orgops-agent-name": ctx.agent.name,
+          },
+          body: JSON.stringify(body),
+        })
+      : await ctx.apiFetch(`/api/agents/${encodeURIComponent(agentName)}/publications`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-orgops-agent-name": ctx.agent.name,
+          },
+          body: JSON.stringify(body),
+        });
+    const publication = await parseResponseBody(response);
+    return { ok: true, agentName, publicPath, publication };
+  }
+
+  if (tool === "agents_unpublish_workspace") {
+    const parsedResult = parseToolArgs(tool, agentsUnpublishWorkspaceSchema, args);
+    if (!parsedResult.ok) return { error: parsedResult.error };
+    const parsed = parsedResult.data;
+    let publicationId = trimOptional(parsed.publicationId);
+    const agentName = trimOptional(parsed.agentName) ?? ctx.agent.name;
+    if (!publicationId) {
+      const slug = trimOptional(parsed.slug);
+      const publicPath = trimOptional(parsed.publicPath);
+      if (!slug && !publicPath) return { error: "Provide publicationId, publicPath, or slug." };
+      const listResponse = await ctx.apiFetch(
+        `/api/agents/${encodeURIComponent(agentName)}/publications`,
+        {
+          headers: { "x-orgops-agent-name": ctx.agent.name },
+        },
+      );
+      const existingList = (await parseResponseBody(listResponse)) as Array<{
+        id?: string;
+        slug?: string;
+        publicPath?: string;
+      }>;
+      publicationId = Array.isArray(existingList)
+        ? existingList.find(
+            (publication) =>
+              (publicPath && publication.publicPath === publicPath) ||
+              (slug && publication.slug === slug.toLowerCase()),
+          )?.id
+        : undefined;
+      if (!publicationId) return { ok: true, agentName, deleted: false, reason: "Publication not found" };
+    }
+    const response = await ctx.apiFetch(
+      `/api/workspace-publications/${encodeURIComponent(publicationId)}`,
+      {
+        method: "DELETE",
+        headers: { "x-orgops-agent-name": ctx.agent.name },
+      },
+    );
+    const deleted = await parseResponseBody(response);
+    return { ok: true, agentName, publicationId, deleted };
   }
 
   if (tool === "agents_update") {
