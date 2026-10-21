@@ -43,6 +43,55 @@ describe("agent runner", () => {
     expect(Object.keys(tools)).toContain("agents_create");
     expect(Object.keys(tools)).toContain("agents_search");
     expect(Object.keys(tools)).toContain("agents_update");
+    expect(Object.keys(tools)).toContain("agents_create_integration_key");
+  });
+
+  it("redacts one-time integration tokens from persisted tool events", async () => {
+    const emitted: Event[] = [];
+    const tools = createRunnerTools({
+      agent: {
+        name: "tester",
+        workspacePath: "/tmp",
+        modelId: "openai:gpt-4o-mini",
+        desiredState: "RUNNING",
+        runtimeState: "RUNNING",
+      },
+      event: {
+        id: "evt-1",
+        type: "message.created",
+        payload: {},
+        source: "human:alice",
+      },
+      channelId: "chan-1",
+      runTool: async () => ({
+        ok: true,
+        key: {
+          token: "org_sk_abcdefghijklmnopqrstuvwxyz1234567890",
+          tokenPrefix: "org_sk_abcde",
+        },
+      }),
+      apiFetch: async () => new Response(),
+      emitEvent: async (event) => {
+        emitted.push(event as Event);
+      },
+    });
+
+    const output = (await tools.agents_create_integration_key?.execute?.({
+      name: "embed",
+    })) as { key?: { token?: string; tokenPrefix?: string } };
+
+    expect(output.key?.token).toBe("org_sk_abcdefghijklmnopqrstuvwxyz1234567890");
+    const executed = emitted.find((event) => event.type === "tool.executed");
+    expect(executed?.payload).toMatchObject({
+      tool: "agents_create_integration_key",
+      sensitiveOutputRedacted: true,
+      output: {
+        key: {
+          token: "[REDACTED: one-time secret]",
+          tokenPrefix: "org_sk_abcde",
+        },
+      },
+    });
   });
 
   it("builds model messages from all channel events", async () => {
@@ -2218,6 +2267,67 @@ describe("agent runner", () => {
     expect(requests[1]?.body).toEqual({
       subscriberType: "AGENT",
       subscriberId: "worker-c",
+    });
+  });
+
+  it("creates integration keys via agents_create_integration_key", async () => {
+    const requests: Array<{ path: string; init?: RequestInit; body?: any }> = [];
+    const ctx = {
+      agent: {
+        name: "tester",
+        soulContents: "role prompt",
+        workspacePath: "/tmp",
+        modelId: "openai:gpt-4o-mini",
+        desiredState: "RUNNING",
+        runtimeState: "RUNNING",
+        assignedRunnerId: "runner-1",
+      },
+      triggerEvent: {
+        id: "evt-trigger",
+        type: "message.created",
+        payload: { text: "hello" },
+        source: "human:alice",
+        channelId: "chan-1",
+      },
+      channelId: "chan-1",
+      injectionEnv: {},
+      apiFetch: async (path: string, init?: RequestInit) => {
+        const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+        requests.push({ path, init, body });
+        return new Response(
+          JSON.stringify({
+            id: "key-1",
+            name: body?.name,
+            agentName: body?.agentName,
+            token: "org_sk_test",
+          }),
+          {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      },
+      emitEvent: async () => {},
+      emitAudit: async () => {},
+    };
+
+    const result = (await executeTool(ctx, "agents_create_integration_key", {
+      name: "webhook",
+    })) as { ok?: boolean; agentName?: string; key?: { token?: string } };
+
+    expect(result.ok).toBe(true);
+    expect(result.agentName).toBe("tester");
+    expect(result.key?.token).toBe("org_sk_test");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.path).toBe("/api/integration-keys");
+    expect(requests[0]?.init?.method).toBe("POST");
+    expect(requests[0]?.init?.headers).toMatchObject({
+      "content-type": "application/json",
+      "x-orgops-agent-name": "tester",
+    });
+    expect(requests[0]?.body).toEqual({
+      name: "webhook",
+      agentName: "tester",
     });
   });
 

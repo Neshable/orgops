@@ -366,7 +366,8 @@ describe("api app", () => {
         method: "POST",
         headers: { "content-type": "application/json", cookie },
         body: JSON.stringify({
-          publicPath: "/agents/snapshot-publisher/dist/",
+          slug: "snapshot-slug",
+          publicPath: "/agents/snapshot-publisher/site/",
           sourcePath: "dist",
           authType: "PASSWORD",
           password: "publish-pass",
@@ -428,30 +429,30 @@ describe("api app", () => {
     expect(revisionRes.status).toBe(200);
 
     const unauthenticatedPublic = await app.request(
-      "http://localhost/agents/snapshot-publisher/dist/",
+      "http://localhost/agents/snapshot-publisher/site/",
     );
     expect(unauthenticatedPublic.status).toBe(200);
     expect(await unauthenticatedPublic.text()).toContain("This published folder is password protected.");
-    const wrongPassword = await app.request("http://localhost/agents/snapshot-publisher/dist/", {
+    const wrongPassword = await app.request("http://localhost/agents/snapshot-publisher/site/", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ password: "wrong" }).toString(),
     });
     expect(wrongPassword.status).toBe(401);
-    const formLogin = await app.request("http://localhost/agents/snapshot-publisher/dist/", {
+    const formLogin = await app.request("http://localhost/agents/snapshot-publisher/site/", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ password: "publish-pass" }).toString(),
     });
     expect(formLogin.status).toBe(303);
     const authCookie = formLogin.headers.get("set-cookie") ?? "";
-    const cookiePublic = await app.request("http://localhost/agents/snapshot-publisher/dist/", {
+    const cookiePublic = await app.request("http://localhost/agents/snapshot-publisher/site/", {
       headers: { cookie: authCookie },
     });
     expect(cookiePublic.status).toBe(200);
     expect(await cookiePublic.text()).toBe("<h1>snapshot</h1>");
     const authenticatedPublic = await app.request(
-      "http://localhost/agents/snapshot-publisher/dist/",
+      "http://localhost/agents/snapshot-publisher/site/",
       {
         headers: {
           authorization: `Basic ${Buffer.from("viewer:publish-pass").toString("base64")}`,
@@ -7198,13 +7199,27 @@ describe("api app", () => {
       headers: {
         "content-type": "application/json",
         "x-orgops-runner-token": "test-token",
+        "x-orgops-agent-name": "invoice-receiver",
       },
       body: JSON.stringify({
         name: "runner-key",
         agentName: "invoice-receiver",
       }),
     });
-    expect(runnerCreate.status).toBe(403);
+    expect(runnerCreate.status).toBe(201);
+    const runnerCreated = (await runnerCreate.json()) as {
+      agentName: string;
+      token: string;
+      tokenHash?: string;
+    };
+    expect(runnerCreated.agentName).toBe("invoice-receiver");
+    expect(runnerCreated.token.startsWith("org_sk_")).toBe(true);
+    expect(runnerCreated.tokenHash).toBeUndefined();
+
+    const runnerMeRes = await app.request("http://localhost/v1/me", {
+      headers: { authorization: `Bearer ${runnerCreated.token}` },
+    });
+    expect(runnerMeRes.status).toBe(200);
 
     const revokeRes = await app.request(
       `http://localhost/api/integration-keys/${created.id}/revoke`,

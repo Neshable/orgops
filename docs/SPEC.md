@@ -240,6 +240,7 @@ to require their singular target.
 - secret text may be sent as `payload.sensitive.plaintext` (or pre-encrypted `ciphertextB64`)
 - API encrypts plaintext into `payload.sensitive.ciphertextB64` using `ORGOPS_MASTER_KEY` before persistence
 - reveal requires `POST /api/events/:id/reveal-sensitive` with the caller's current password
+- runner guidance tells agents to use `payload.sensitive.plaintext` for one-time tokens; persisted `tool.executed` output for token-creating tools is redacted before insertion into the append-only event log
 
 Validation is dynamic and composed from:
 
@@ -373,7 +374,7 @@ Published topics include:
   - accepts text-only user messages and mixed content arrays (for example `text` + `image_url`)
   - supports optional top-level `attachments` array (`[{ fileId, ... }]`)
   - attachment references are normalized from `messages[].content` or `attachments`, then persisted on the emitted `message.created` payload as `payload.attachments[]` with file metadata
-- Admin key management: `GET/POST /api/integration-keys`, `POST /api/integration-keys/:id/revoke`
+- Key management: humans use `GET/POST /api/integration-keys` and `POST /api/integration-keys/:id/revoke`; runner-authenticated agents may also `POST /api/integration-keys` for agents they can manage. Integration tokens are only returned at creation time.
 - Integrator prompt: copy from admin UI → API keys
 
 ### Models
@@ -629,6 +630,7 @@ Current tool families exposed to models:
 - agent management helpers:
   - `agents_search`, `agents_create`
   - `agents_publish_workspace`, `agents_unpublish_workspace`, `agents_list_publications`
+  - `agents_create_integration_key`
 
 ### Workspace Publications
 
