@@ -215,7 +215,7 @@ of truth for ordering and policy.
 
 ### Agent Invites / Runner Tokens
 
-- `agent_invites`: wrapped-agent bootstrap invites (hashed token, optional scoped channel set, invite-time agent visibility, creator metadata for human/agent callers, optional wrapped config, expiry, usage count)
+- `agent_invites`: wrapped-agent bootstrap invites (hashed token, optional scoped channel set, optional channel expansion, invite-time agent visibility, creator metadata for human/agent callers, optional wrapped config, expiry, usage count)
 - `runner_tokens`: hashed runner credentials, including invite-scoped tokens bound to a single `agent_name` and `runner_id`
 
 ## Event Contract
@@ -278,10 +278,11 @@ Validation is dynamic and composed from:
 - Runner-only endpoint for secret env injection: `GET /api/secrets/env`
 - Runner secret env requests must include `x-orgops-agent-name`; optional `x-orgops-channel-id` enables team-scope resolution for that channel context.
 - Invite redemption can mint runner tokens in either mode:
-  - `SCOPED` (default): restricted to one agent and one runner ID, and by default restricted to invite-approved channels.
+  - `SCOPED` (default): restricted to one agent and one runner ID, and by default restricted to invite-approved channels. When `allowChannelExpansion` is enabled on the invite, the scoped runner may also view and post in channels where that agent is later added as an `AGENT` participant.
   - `GLOBAL`: behaves like a normal unrestricted runner token (full runner access).
 - `POST /api/agent-invites` accepts authenticated humans and runner-authenticated agents.
 - Scoped invites can later be promoted to global mode with `POST /api/agent-invites/:id/promote-global`; this updates the invite and any non-revoked redeemed runner tokens from that invite.
+- Scoped invites can later enable channel expansion with `POST /api/agent-invites/:id/enable-channel-expansion`; this updates the invite and any non-revoked redeemed scoped runner tokens from that invite.
 
 ### Tool Filesystem Access
 
@@ -353,14 +354,17 @@ Published topics include:
 - wrapped-agent invites:
   - `GET /api/agent-invites`
   - `POST /api/agent-invites`
+  - `DELETE /api/agent-invites/:id` (removes invite record/link; redeemed runner tokens are not changed)
   - `POST /api/agent-invites/:id/revoke`
   - `POST /api/agent-invites/:id/reissue` (rotates token; old link invalid)
   - `POST /api/agent-invites/:id/promote-global` (switches scoped invite/tokens to global mode)
+  - `POST /api/agent-invites/:id/enable-channel-expansion` (enables subscribed-channel expansion for scoped invite/tokens)
   - `GET /api/agent-invites/public/:token` (public)
   - `POST /api/agent-invites/public/:token/redeem` (public)
   - `channelIds` is optional on create (invite may grant lifecycle-only bootstrap access)
   - create payload supports `visibility` (`PUBLIC`/`PRIVATE`) applied to the wrapped agent at redeem time
   - create payload supports `runnerScopeMode` (`SCOPED` default, or `GLOBAL`)
+  - create payload supports `allowChannelExpansion` for scoped invites; this does not auto-subscribe the agent, but lets the redeemed scoped runner follow channels where the agent is explicitly subscribed after redemption. Scoped invites with no initial `channelIds` automatically enable channel expansion.
   - invite list/create responses include creator metadata (`createdByType`, `createdById`)
   - invite links are resolved from request origin (`x-forwarded-*` or request URL), not hardcoded localhost
   - public invite/redeem responses include bootstrap hints (`wrappedConfigSchema`, patch endpoint, and session-memory guidance)
