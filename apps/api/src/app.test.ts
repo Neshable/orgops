@@ -7504,6 +7504,19 @@ describe("api app", () => {
       `http://localhost/api/agent-invites/public/${encodeURIComponent(reissuedToken)}`,
     );
     expect(inviteInfoRes.status).toBe(200);
+    const inviteInfo = (await inviteInfoRes.json()) as {
+      bootstrap?: {
+        youAre?: string;
+        identity?: { role?: string; host?: string };
+        access?: { apiHeader?: string };
+        discover?: { repo?: string; spec?: string };
+      };
+    };
+    expect(inviteInfo.bootstrap?.identity?.role).toBe("WRAPPED");
+    expect(inviteInfo.bootstrap?.identity?.host).toBe("orgops-agent-runner");
+    expect(inviteInfo.bootstrap?.access?.apiHeader).toBe("x-orgops-runner-token");
+    expect(inviteInfo.bootstrap?.discover?.repo).toBe("https://github.com/camplight/orgops");
+    expect(inviteInfo.bootstrap?.youAre).toContain("WRAPPED OrgOps agent");
 
     const redeemRes = await app.request(
       `http://localhost/api/agent-invites/public/${encodeURIComponent(reissuedToken)}/redeem`,
@@ -7513,7 +7526,10 @@ describe("api app", () => {
     const redeemed = (await redeemRes.json()) as {
       runner: { token: string; runnerId: string; allowChannelExpansion?: boolean };
       agent: { name: string; assignedRunnerId: string; visibility?: string };
+      bootstrap?: { identity?: { role?: string }; access?: { apiHeader?: string } };
     };
+    expect(redeemed.bootstrap?.identity?.role).toBe("WRAPPED");
+    expect(redeemed.bootstrap?.access?.apiHeader).toBe("x-orgops-runner-token");
     expect(redeemed.runner.token.startsWith("org_rt_")).toBe(true);
     expect(redeemed.runner.allowChannelExpansion).toBe(true);
     expect(redeemed.agent.name).toBe("claude-bridge");

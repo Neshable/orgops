@@ -56,7 +56,7 @@ Stored in `agents`:
 
 On API startup, when `agents` is empty, OrgOps seeds one public agent named `system` if `ORGOPS_SYSTEM_AGENT_MODEL` is set. The value is a provider (`openai`, `anthropic`/`claude`, `openrouter`/`or`) or `provider:model`. A bare provider uses `openai:gpt-5.2`, `anthropic:claude-3-5-sonnet-latest`, or `openrouter:openai/gpt-4o-mini`. Seeding also stores the matching provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`) as a public secret and inserts an enabled `models` row. The agent is skipped when the model is unset, the provider is unsupported, the API key is empty, `ORGOPS_MASTER_KEY` cannot encrypt the secret, or any agent row already exists. The seeded agent is unassigned; a runner executes it after `assigned_runner_id` is set.
 
-`WRAPPED` agents are orgops-owned lifecycle records whose turns are delegated to an external runtime. They do not use orgops memory summaries, prompt composition, skills, model calls, or `allow_outside_workspace` for turn handling. The wrapped runtime owns its own session/memory/tool state and filesystem policy. `soul_contents` may still be stored on the agent row for humans, opscli, and native management agents; the wrapper runner does not automatically inject it. The creator of the wrapped agent should translate it into the selected harness configuration/setup/runtime behavior when that harness needs a soul or prompt seed.
+`WRAPPED` agents are orgops-owned lifecycle records whose turns are delegated to an external runtime. They do not use orgops memory summaries, prompt composition, skills, model calls, or `allow_outside_workspace` for turn handling. The wrapped runtime owns its own session/memory/tool state and filesystem policy. The runner still injects `ORGOPS_API_URL` and `ORGOPS_RUNNER_TOKEN` into setup/runtime/sidecar processes so the wrapped agent can call the OrgOps HTTP API with `x-orgops-runner-token` (scoped tokens stay limited to that agent and invite-approved channels). `soul_contents` may still be stored on the agent row for humans, opscli, and native management agents; the wrapper runner does not automatically inject it. The creator of the wrapped agent should translate it into the selected harness configuration/setup/runtime behavior when that harness needs a soul or prompt seed.
 
 Example wrapped config:
 
@@ -367,7 +367,7 @@ Published topics include:
   - create payload supports `allowChannelExpansion` for scoped invites; this does not auto-subscribe the agent, but lets the redeemed scoped runner follow channels where the agent is explicitly subscribed after redemption. Scoped invites with no initial `channelIds` automatically enable channel expansion.
   - invite list/create responses include creator metadata (`createdByType`, `createdById`)
   - invite links are resolved from request origin (`x-forwarded-*` or request URL), not hardcoded localhost
-  - public invite/redeem responses include bootstrap hints (`wrappedConfigSchema`, patch endpoint, and session-memory guidance)
+  - public invite/redeem responses include bootstrap hints (`youAre` / identity, API access via `x-orgops-runner-token`, public-repo discover links, `wrappedConfigSchema`, patch endpoint, and session-memory guidance)
 
 ### Embed / v1 (integration API keys)
 
@@ -662,13 +662,17 @@ Audit events are emitted around tool/process operations and RLM execution.
 `apps/opscli` is a standalone host bootstrap/maintenance CLI with deterministic commands and an optional chat loop.
 
 - deterministic commands:
-  - `install` (prereq checks + clone/pull repo + `npm ci` + component-scoped build/config)
+  - `install` (source checkout/archive + managed toolchain + `npm ci` + component-scoped build/config)
   - `upgrade` (safety backup + component-scoped stop/update + optional restart)
-  - `doctor` (host prerequisite check)
-  - `start` / `stop` / `status` for selected components (`api`, `runner`, `user-ui`, `admin-ui`)
+  - `uninstall` (stop components + unregister services + remove install, preserving data by default)
+  - `component add` / `component remove` for post-install component changes
+  - `doctor` (host prerequisite report; git is optional)
+  - `--yes` / `--json` on deterministic commands for agent/non-interactive use
+  - `start` / `stop` / `restart` / `status` for selected components (`api`, `runner`, `user-ui`, `admin-ui`)
   - `admin open` / `admin stop` / `admin status` convenience wrappers for `admin-ui`
   - `service register` to register/start OS-specific auto-start per component (`api`, `runner`, `user-ui`, `admin-ui`) without install/upgrade
   - `service unregister` to remove OS-specific auto-start per component without install/upgrade
+  - `service start` / `service stop` / `service restart` / `service status` for registered OS services
   - `shortcut create` to create a cross-OS desktop shortcut for `user-ui` or `admin-ui` without install/upgrade
   - install/upgrade support runner bootstrap via:
     - explicit `--runner-api-url` + `--runner-token` (+ optional `--runner-name`)
@@ -678,10 +682,16 @@ Audit events are emitted around tool/process operations and RLM execution.
   - rolling summarization + context-capped history
   - prompts for provider API keys only in chat mode
 - release build embeds docs/build metadata for chat context (not a full source snapshot)
-- auto-start registration is OS-specific:
-  - macOS LaunchAgent
+- install writes `.opscli-toolchain.json` plus a generated working `.env` (random `ORGOPS_MASTER_KEY`, runner token, and admin password, plus local API URL/port). It does not copy `.env.example`. Existing `.env` keys are left unchanged; generated admin credentials are printed once when created
+- install also writes `.env` path hints for the Node/npm runtime used by services; by default OpsCLI downloads a private Node toolchain under `~/.orgops/toolchains`, with `ORGOPS_OPSCLI_USE_SYSTEM_TOOLCHAIN=1` as an explicit system-toolchain override
+- git is the default source mode so installed OrgOps is a local repository for agent workflows; if git is missing, OpsCLI tries to install it, and `--no-git` opts into a GitHub source archive path instead
+- git upgrades checkpoint dirty trees with a local autosave commit, then rebase local changes onto the requested upstream ref
+- uninstall preserves `.env`, `.orgops-data`, `files`, and `.opscli-backups` unless `--purge-data` is passed
+- auto-start registration is OS-specific per-user login services that run from source with a managed Node PATH and no visible windows:
+  - macOS LaunchAgent (`ProcessType=Background`)
   - Linux systemd user service
-  - Windows Scheduled Task
+  - Windows Scheduled Task (`WindowStyle Hidden`)
+- `start` / `stop` / `restart` / `status` prefer registered OS services when a component is in `serviceComponents`, otherwise they use detached PID-file processes
 
 Security note: wrapped `source`, `setup.command`, and `runtime.command` are host code execution. Native orgops agents and opscli should treat GitHub-derived wrapper recipes as privileged changes and should prefer explicit user approval or trusted repo allowlists before enabling them on shared hosts.
 
@@ -775,6 +785,11 @@ Security note: wrapped `source`, `setup.command`, and `runtime.command` are host
   - `ORGOPS_OPSCLI_SPINNER`
   - `ORGOPS_OPSCLI_LOG_PATH`
   - `ORGOPS_OPSCLI_DOUBLE_SIGINT_MS`
+  - `ORGOPS_OPSCLI_USE_SYSTEM_TOOLCHAIN`
+  - `ORGOPS_OPSCLI_TOOLCHAIN_DIR`
+  - `ORGOPS_OPSCLI_NODE_VERSION`
+  - `ORGOPS_OPSCLI_SERVICE_DRY_RUN`
+  - `ORGOPS_OPSCLI_SKIP_GIT_INSTALL`
 
 ### Google Workspace identity
 

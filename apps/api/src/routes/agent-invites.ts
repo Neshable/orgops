@@ -25,6 +25,60 @@ type AgentInvitesDeps = {
 
 type RunnerScopeMode = "SCOPED" | "GLOBAL";
 
+const PUBLIC_REPO_URL = "https://github.com/camplight/orgops";
+
+function wrappedInviteBootstrap(agentName: string) {
+  return {
+    youAre:
+      "You are a WRAPPED OrgOps agent. OrgOps is a self-hosted control plane; an agent-runner on a host owns your lifecycle and will exec your local runtime. You are not a native CLASSIC/RLM agent. You can call the OrgOps HTTP API with the injected runner token.",
+    identity: {
+      role: "WRAPPED" as const,
+      agentName,
+      host: "orgops-agent-runner",
+    },
+    access: {
+      apiHeader: "x-orgops-runner-token",
+      env: [
+        "ORGOPS_API_URL",
+        "ORGOPS_RUNNER_TOKEN",
+        "ORGOPS_WRAPPED_AGENT_NAME",
+        "ORGOPS_WRAPPED_CHANNEL_ID",
+        "ORGOPS_WRAPPED_MESSAGE",
+        "ORGOPS_WRAPPED_WORKSPACE_PATH",
+      ],
+      note: "After the runner starts you, ORGOPS_API_URL and ORGOPS_RUNNER_TOKEN are in your process env. Send the token as x-orgops-runner-token. A SCOPED token is limited to this agent and invite-approved channels.",
+    },
+    discover: {
+      repo: PUBLIC_REPO_URL,
+      spec: `${PUBLIC_REPO_URL}/blob/main/docs/SPEC.md`,
+      inviteGuide: `${PUBLIC_REPO_URL}/blob/main/docs/WRAPPED_AGENT_INVITES.md`,
+      overview: `${PUBLIC_REPO_URL}/blob/main/PROJECT_OVERVIEW.md`,
+    },
+    wrappedConfigRequiredBeforeRunning: true,
+    wrappedConfigPatchEndpoint: `/api/agents/${encodeURIComponent(agentName)}`,
+    wrappedConfigSchema: {
+      required: ["runtime.command"],
+      optional: [
+        "kind",
+        "harness",
+        "runtime.parse",
+        "runtime.timeoutMs",
+        "setup.*",
+        "source.*",
+        "sidecars[]",
+        "secrets.allowedKeys",
+        "secrets.deniedKeys",
+        "session.scope",
+      ],
+    },
+    memoryHint:
+      "For CLIs that support sessions, keep a per-channel session map keyed by ORGOPS_WRAPPED_CHANNEL_ID.",
+    docs: {
+      wrappedInviteGuide: `${PUBLIC_REPO_URL}/blob/main/docs/WRAPPED_AGENT_INVITES.md`,
+    },
+  };
+}
+
 function isHumanUser(user: RequestUser | undefined): user is RequestUser & {
   id: string;
   username: string;
@@ -593,31 +647,7 @@ export function registerAgentInviteRoutes(app: Hono<any>, deps: AgentInvitesDeps
         allowChannelExpansion: inviteAllowsChannelExpansion(invite),
         expiresAt: invite.expires_at,
       },
-      bootstrap: {
-        wrappedConfigRequiredBeforeRunning: true,
-        wrappedConfigPatchEndpoint: `/api/agents/${encodeURIComponent(invite.agent_name)}`,
-        wrappedConfigSchema: {
-          required: ["runtime.command"],
-          optional: [
-            "kind",
-            "harness",
-            "runtime.parse",
-            "runtime.timeoutMs",
-            "setup.*",
-            "source.*",
-            "sidecars[]",
-            "secrets.allowedKeys",
-            "secrets.deniedKeys",
-            "session.scope",
-          ],
-        },
-        memoryHint:
-          "For CLIs that support sessions, keep a per-channel session map keyed by ORGOPS_WRAPPED_CHANNEL_ID.",
-        docs: {
-          wrappedInviteGuide:
-            "https://github.com/camplight/orgops/blob/main/docs/WRAPPED_AGENT_INVITES.md",
-        },
-      },
+      bootstrap: wrappedInviteBootstrap(invite.agent_name),
       redeemEndpoint: `/api/agent-invites/public/${encodeURIComponent(token)}/redeem`,
     });
   });
@@ -823,30 +853,11 @@ export function registerAgentInviteRoutes(app: Hono<any>, deps: AgentInvitesDeps
         heartbeat: `/api/runners/${encodeURIComponent(runnerId)}/heartbeat`,
         patchAgent: `/api/agents/${encodeURIComponent(invite.agent_name)}`,
       },
-      bootstrap: {
-        wrappedConfigRequiredBeforeRunning: true,
-        wrappedConfigPatchEndpoint: `/api/agents/${encodeURIComponent(invite.agent_name)}`,
-        wrappedConfigSchema: {
-          required: ["runtime.command"],
-          optional: [
-            "kind",
-            "harness",
-            "runtime.parse",
-            "runtime.timeoutMs",
-            "setup.*",
-            "source.*",
-            "sidecars[]",
-            "secrets.allowedKeys",
-            "secrets.deniedKeys",
-            "session.scope",
-          ],
-        },
-        memoryHint:
-          "For CLIs that support sessions, keep a per-channel session map keyed by ORGOPS_WRAPPED_CHANNEL_ID.",
-      },
+      bootstrap: wrappedInviteBootstrap(invite.agent_name),
       docs: {
-        setupGuideUrl:
-          "https://github.com/camplight/orgops/blob/main/docs/WRAPPED_AGENT_INVITES.md",
+        setupGuideUrl: `${PUBLIC_REPO_URL}/blob/main/docs/WRAPPED_AGENT_INVITES.md`,
+        specUrl: `${PUBLIC_REPO_URL}/blob/main/docs/SPEC.md`,
+        repoUrl: PUBLIC_REPO_URL,
       },
     });
   });
