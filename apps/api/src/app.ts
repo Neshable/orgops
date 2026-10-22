@@ -633,7 +633,7 @@ export function createApp(config: AppConfig = {}) {
     validateEventAgainstShapes,
     serializeEventShapes,
     access,
-    verifyPassword,
+    verifyPassword:verifyPasswordAsync,
   });
 
   registerMemoryRoutes(app as any, { orm, jsonResponse, access });
