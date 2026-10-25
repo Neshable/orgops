@@ -3,6 +3,7 @@ import {
   type HumanSession,
 } from "./routes/google-auth";
 import { Hono } from "hono";
+import {registerHttpBoundaries} from "./http-boundaries";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -86,6 +87,7 @@ type AppEnv = {
 
 export function createApp(config: AppConfig = {}) {
   const app = new Hono<AppEnv>();
+  registerHttpBoundaries(app);
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
   const PROJECT_ROOT = resolve(
     config.projectRoot ??

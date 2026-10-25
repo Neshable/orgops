@@ -906,3 +906,22 @@ bytes through the authenticated file API, and returns `attachment` metadata and
 a download URL. It does not publish a message: include the returned object in
 `message.created.payload.attachments` via `events_emit` to share it. Wrapped
 external runtimes do not automatically receive native runner tools.
+
+### Production HTTP resource boundaries
+
+All `/api/*` requests have production body limits, including streams without a
+Content-Length: 1 MiB for ordinary API calls, 21 MiB for multipart uploads (retains
+the runner's 20 MiB file capacity), and 16 MiB for agent copy/move/transfer routes.
+Operators can set positive integer byte limits with `ORGOPS_API_MAX_BODY_BYTES`,
+`ORGOPS_UPLOAD_MAX_BODY_BYTES` and `ORGOPS_TRANSFER_MAX_BODY_BYTES`. Authentication
+retains its stricter 4 KiB limit. Oversized requests return JSON 413 before route
+parsing or database writes. Large existing clients may need explicit adjustment.
+
+API responses include nosniff, no-referrer, same-origin framing, a restrictive
+API CSP, disabled browser camera/microphone/geolocation permissions, and private
+no-store caching. These apply to API errors too. Existing download policies remain
+more restrictive. Product HTML/publication routes and a separately hosted SPA
+must configure their own compatible policy at their deployment boundary; see
+`docs/DEPLOYMENT_SECURITY.md`. An API middleware cannot fix a host nginx rule that
+routes `/health` to the SPA, and shipping a controller source file does not install
+it on a host.
