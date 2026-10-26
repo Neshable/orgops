@@ -30,6 +30,7 @@ import {
   EventSchema,
   type EventShapeDefinition,
   getCoreEventShapes,
+  resolveModelCapabilities,
   serializeEventShapes,
   validateEventAgainstShapes,
 } from "@orgops/schemas";
@@ -54,6 +55,10 @@ import { registerRunnersRoutes } from "./routes/runners";
 import { registerIntegrationKeysRoutes } from "./routes/integration-keys";
 import { registerEmbedRoutes } from "./routes/embed";
 import { registerBillingRoutes } from "./routes/billing";
+import { registerVoiceRoutes } from "./routes/voice";
+import { createVoiceTranscriber } from "./voice-transcriber";
+import { createRealtimeVoice } from "./voice-realtime";
+import type { transcribe as TranscribeFn } from "@orgops/llm";
 import { registerFederationRoutes } from "./routes/federation";
 import { registerWorkspacePublicationRoutes } from "./routes/workspace-publications";
 import {
@@ -75,6 +80,11 @@ export type AppConfig = {
   runnerToken?: string;
   runnerApiUrl?: string;
   projectRoot?: string;
+  /** Overrides speech-to-text for the channel transcriber (tests). */
+  voiceTranscribe?: typeof TranscribeFn;
+  voiceTranscriberEnv?: () => Record<string, string | undefined>;
+  /** Overrides the HTTP client used to create OpenAI realtime calls (tests). */
+  realtimeFetch?: typeof fetch;
 };
 
 type AppEnv = {
@@ -705,6 +715,22 @@ export function createApp(config: AppConfig = {}) {
 
   registerIntegrationKeysRoutes(app as any, { orm, jsonResponse, access });
   registerEmbedRoutes(app as any, { orm, jsonResponse, insertEvent });
+  const voiceTranscriber = createVoiceTranscriber({
+    orm,
+    insertEvent,
+    transcribe: config.voiceTranscribe,
+    env: config.voiceTranscriberEnv,
+  });
+  bus.subscribe("org:events", (message: any) => {
+    if (message?.data) voiceTranscriber.handleEvent(message.data);
+  });
+  const realtimeVoice = createRealtimeVoice({
+    orm,
+    insertEvent,
+    access,
+    fetch: config.realtimeFetch,
+  });
+  registerVoiceRoutes(app as any, { jsonResponse, requireAuth, voiceTranscriber, realtimeVoice });
   registerBillingRoutes(app as any, {
     orm,
     jsonResponse,
@@ -713,7 +739,7 @@ export function createApp(config: AppConfig = {}) {
     requireRunnerAuth,
   });
 
-  return { app, db, bus, injectWebSocket };
+  return { app, db, bus, injectWebSocket, voiceTranscriber };
 }
 
 const SYSTEM_AGENT_NAME = "system";
@@ -722,12 +748,14 @@ const DEFAULT_MODEL_NAME_BY_PROVIDER = {
   openai: "gpt-5.2",
   anthropic: "claude-3-5-sonnet-latest",
   openrouter: "openai/gpt-4o-mini",
+  mistral: "mistral-small-latest",
 } as const;
 
 const PROVIDER_API_KEY_ENV = {
   openai: "OPENAI_API_KEY",
   anthropic: "ANTHROPIC_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
+  mistral: "MISTRAL_API_KEY",
 } as const;
 
 type SystemAgentProvider = keyof typeof DEFAULT_MODEL_NAME_BY_PROVIDER;
@@ -737,6 +765,7 @@ function normalizeSystemAgentProvider(raw: string): SystemAgentProvider | null {
   if (normalized === "openai") return "openai";
   if (normalized === "anthropic" || normalized === "claude") return "anthropic";
   if (normalized === "openrouter" || normalized === "or") return "openrouter";
+  if (normalized === "mistral" || normalized === "mistralai") return "mistral";
   return null;
 }
 
@@ -841,7 +870,9 @@ function seedDefaultSystemAgent(
           provider: resolved.provider,
           model_name: resolved.modelName,
           enabled: 1,
-          defaults_json: "{}",
+          defaults_json: JSON.stringify({
+            capabilities: resolveModelCapabilities(resolved.provider, resolved.modelName, {}),
+          }),
           created_at: now,
         })
         .run();

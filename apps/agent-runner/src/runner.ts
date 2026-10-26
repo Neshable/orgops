@@ -31,6 +31,7 @@ import {
 } from "./wrapped-runtime";
 import { buildModelMessages, selectRecentDeltaEventsForPrompt } from "./prompt-composer";
 import { createWorkspacePublicationSync } from "./workspace-publication-sync";
+import { createRealtimeVoiceManager } from "./realtime-voice";
 import type { Agent, Event } from "./types";
 
 const API_URL = process.env.ORGOPS_API_URL ?? "http://localhost:8787";
@@ -128,6 +129,15 @@ const maintenanceLoop = createMaintenanceLoop({
   crossRecentMemoryIntervalMs: CROSS_RECENT_MEMORY_INTERVAL_MS,
   crossFullMemoryIntervalMs: CROSS_FULL_MEMORY_INTERVAL_MS,
 });
+const realtimeVoice = createRealtimeVoiceManager({
+  api: {
+    apiFetch: api.apiFetch,
+    emitEvent: api.emitEvent,
+    getPackageSecretsEnv: api.getPackageSecretsEnv,
+    getChannelRecord: api.getChannelRecord,
+  },
+  skillRoots: SKILL_ROOTS,
+});
 const workspacePublicationSync = createWorkspacePublicationSync({
   apiFetch: api.apiFetch,
   getRunnerId: () => state.registeredRunnerId,
@@ -198,6 +208,7 @@ async function pollAgent(agent: Agent) {
     state.bootstrappedAgentKeys.delete(agent.name);
     clearAgentIntentWatch(state.intentWatch, agent.name);
     maintenanceLoop.clearAgent(agent.name);
+    await realtimeVoice.endAgentCalls(agent.name);
     if ((agent.mode ?? "CLASSIC") === "WRAPPED") {
       await stopWrappedAgentRuntime(agent.name);
     }
@@ -277,12 +288,15 @@ async function pollAgent(agent: Agent) {
   const pendingBuckets = await Promise.all(
     subscribedChannelIds.map(async (channelId) => {
       if (channelLoopManager.isChannelBusy(agent.name, channelId)) {
-        return [] as Event[];
+        // Call setup must not wait for a running text turn to finish.
+        return api.listPendingEventsForAgentChannel(agent.name, channelId, {
+          typePrefix: "voice.realtime.",
+        });
       }
       return api.listPendingEventsForAgentChannel(agent.name, channelId);
     }),
   );
-  const events = pendingBuckets.flat();
+  const events = realtimeVoice.consume(agent, pendingBuckets.flat());
   ingestIntentEvents({
     intents: state.intentWatch,
     agentName: agent.name,
@@ -348,6 +362,7 @@ async function reconcileRemovedAgents(activeAgents: Agent[]) {
     state.bootstrappedAgentKeys.delete(agentName);
     clearAgentIntentWatch(state.intentWatch, agentName);
     maintenanceLoop.clearAgent(agentName);
+    await realtimeVoice.endAgentCalls(agentName, "agent_removed");
     await stopWrappedAgentRuntime(agentName);
   }
 }
@@ -409,6 +424,7 @@ export async function loop() {
   process.off("SIGINT", onSigint);
   process.off("SIGTERM", onSigterm);
   await maintenanceLoop.awaitInFlight();
+  await realtimeVoice.endAll();
   const wrappedShutdownSummary = await stopAllWrappedRuntimes();
   if (wrappedShutdownSummary.stopped > 0) {
     console.log(

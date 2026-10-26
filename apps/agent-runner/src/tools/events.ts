@@ -22,6 +22,8 @@ const channelMessagesSchema = z.object({
   channelId: z.string().min(1),
   limit: z.number().int().min(1).max(500).optional(),
   after: z.number().int().min(0).optional(),
+  before: z.number().int().min(0).optional(),
+  order: z.enum(["asc", "desc"]).optional(),
 });
 
 const searchSchema = z.object({
@@ -32,6 +34,7 @@ const searchSchema = z.object({
   sourcePrefix: z.string().min(1).optional(),
   status: z.string().min(1).optional(),
   after: z.number().int().min(0).optional(),
+  before: z.number().int().min(0).optional(),
   limit: z.number().int().min(1).max(500).optional(),
   order: z.enum(["asc", "desc"]).optional(),
   scheduled: z.boolean().optional(),
@@ -242,12 +245,12 @@ export const eventsToolDefs: ToolDef[] = [
   ],
   [
     "events_channel_messages",
-    "Get message.created events from a channel.",
+    "Get message.created events from a channel. Use before (createdAt ms) with order=desc to page back through history older than what is in your prompt.",
     channelMessagesSchema,
   ],
   [
     "events_search",
-    "Search events across all visible channels with optional filters (type/source/status/time/order).",
+    "Search events across all visible channels with optional filters (type/source/status/after/before/order).",
     searchSchema,
   ],
   [
@@ -590,6 +593,8 @@ export async function execute(
     query.set("type", "message.created");
     query.set("limit", String(parsed.limit ?? 100));
     if (parsed.after !== undefined) query.set("after", String(parsed.after));
+    if (parsed.before !== undefined) query.set("before", String(parsed.before));
+    if (parsed.order) query.set("order", parsed.order);
     const response = await ctx.apiFetch(`/api/events?${query.toString()}`);
     const events = (await response.json()) as unknown[];
     return { channelId: parsed.channelId, events };
@@ -622,6 +627,7 @@ export async function execute(
     if (parsed.sourcePrefix) query.set("sourcePrefix", parsed.sourcePrefix);
     if (parsed.status) query.set("status", parsed.status);
     if (parsed.after !== undefined) query.set("after", String(parsed.after));
+    if (parsed.before !== undefined) query.set("before", String(parsed.before));
     if (parsed.limit !== undefined) query.set("limit", String(parsed.limit));
     if (parsed.order) query.set("order", parsed.order);
     if (parsed.scheduled !== undefined) query.set("scheduled", parsed.scheduled ? "1" : "0");

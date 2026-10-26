@@ -54,7 +54,7 @@ Stored in `agents`:
 - secret delegation toggle: `allow_owner_human_secrets` (when enabled and owner exists, user-scoped secrets are injected for native turns)
 - wrapped runtime config: `wrapped_config_json` (JSON object; used only by `WRAPPED` mode)
 
-On API startup, when `agents` is empty, OrgOps seeds one public agent named `system` if `ORGOPS_SYSTEM_AGENT_MODEL` is set. The value is a provider (`openai`, `anthropic`/`claude`, `openrouter`/`or`) or `provider:model`. A bare provider uses `openai:gpt-5.2`, `anthropic:claude-3-5-sonnet-latest`, or `openrouter:openai/gpt-4o-mini`. Seeding also stores the matching provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`) as a public secret and inserts an enabled `models` row. The agent is skipped when the model is unset, the provider is unsupported, the API key is empty, `ORGOPS_MASTER_KEY` cannot encrypt the secret, or any agent row already exists. The seeded agent is unassigned; a runner executes it after `assigned_runner_id` is set.
+On API startup, when `agents` is empty, OrgOps seeds one public agent named `system` if `ORGOPS_SYSTEM_AGENT_MODEL` is set. The value is a provider (`openai`, `anthropic`/`claude`, `openrouter`/`or`, `mistral`/`mistralai`) or `provider:model`. A bare provider uses `openai:gpt-5.2`, `anthropic:claude-3-5-sonnet-latest`, `openrouter:openai/gpt-4o-mini`, or `mistral:mistral-small-latest`. Seeding also stores the matching provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or `MISTRAL_API_KEY`) as a public secret and inserts an enabled `models` row with inferred capability metadata. The agent is skipped when the model is unset, the provider is unsupported, the API key is empty, `ORGOPS_MASTER_KEY` cannot encrypt the secret, or any agent row already exists. The seeded agent is unassigned; a runner executes it after `assigned_runner_id` is set.
 
 `WRAPPED` agents are orgops-owned lifecycle records whose turns are delegated to an external runtime. They do not use orgops memory summaries, prompt composition, skills, model calls, or `allow_outside_workspace` for turn handling. The wrapped runtime owns its own session/memory/tool state and filesystem policy. The runner still injects `ORGOPS_API_URL` and `ORGOPS_RUNNER_TOKEN` into setup/runtime/sidecar processes so the wrapped agent can call the OrgOps HTTP API with `x-orgops-runner-token` (scoped tokens stay limited to that agent and invite-approved channels). `soul_contents` may still be stored on the agent row for humans, opscli, and native management agents; the wrapper runner does not automatically inject it. The creator of the wrapped agent should translate it into the selected harness configuration/setup/runtime behavior when that harness needs a soul or prompt seed.
 
@@ -234,6 +234,12 @@ retain channel history access but do not start a turn for this message. Messages
 without either field keep ordinary channel routing. Scheduled triggers continue
 to require their singular target.
 
+Target lists are also honored for non-message events. All `voice.*` events are
+runner bookkeeping and never wake agents; speech reaches agents as transcribed
+`message.created` events (see Realtime Voice). Realtime call transcripts
+(`payload.voice.mode = "realtime"`) are also skipped by text turns: the call
+already answered them.
+
 `message.created` accepts optional `payload.sensitive` metadata for protected content:
 
 - sender-safe preview remains in `payload.text`
@@ -386,6 +392,99 @@ Published topics include:
 - `GET /api/models`
 - `POST /api/models`
 - `PATCH /api/models/:id`
+- model responses include inferred `capabilities` merged with optional `defaults.capabilities`; agents expose the same effective model capabilities as `modelCapabilities`. Capability flags are advisory UI/runtime metadata such as `audioInput`, `audioOutput`, `realtimeAudioInput`, `realtimeAudioOutput`, `imageInput`, and `toolCalling`. `replyContract` (`json` | `plain-text`) selects how native turns return their final output; it defaults to `plain-text` for OpenAI realtime models and `json` otherwise, and can be overridden per model via `defaults.capabilities.replyContract`. `contextWindowTokens` sizes the runner's prompt history budget; resolution is capability (inferred 32k for OpenAI realtime models, or `defaults.capabilities.contextWindowTokens`) → models.dev metadata → a built-in fallback table. When history is cut, the runner adds a `system.history.truncated` note carrying `omittedBefore` (oldest included `createdAt`) and instructions to page older events with `events_channel_messages` / `events_search` using `before` + `order: "desc"`.
+
+### Realtime Voice
+
+Voice is a layer on top of the text channel: everything said becomes an
+ordinary `message.created`, so text-only humans and agents catch up from the
+transcript. There are two paths: voice messages (hold-to-talk, any agent) and
+realtime calls (speech-to-speech with a realtime-capable agent).
+
+Voice message pipeline:
+
+1. Hold-to-talk records the whole press as one audio file and uploads it via
+   `POST /api/files`.
+2. The UI posts `voice.input.chunk` (`payload.mode` = `message`; the transcriber
+   also still accepts legacy `live` chunks), `speakerId`, `attachment`, timing.
+3. The API channel transcriber (`apps/api/src/voice-transcriber.ts`) listens on
+   the event bus, transcribes chunks serially per channel (preserving speaking
+   order), and inserts `message.created` with `source` = the chunk's source,
+   `parentEventId` = the chunk, `idempotencyKey` = `voice-transcript:<chunkId>`,
+   the audio in `payload.attachments[]` (`kind: "voice"`), and
+   `payload.voice` = `{ mode, status: transcribed|empty|failed, chunkEventId,
+   speakerId, sessionId?, durationMs?, transcribedBy?, language?, error? }`.
+   Silent live utterances are dropped; failed or empty voice messages are still
+   posted with fallback text so the audio is never lost.
+
+Transcription model: `ORGOPS_TRANSCRIPTION_MODEL` (`provider:model`, or `off`).
+When unset it defaults to `mistral:voxtral-mini-latest` if `MISTRAL_API_KEY` is
+available, else `openai:gpt-4o-mini-transcribe` if `OPENAI_API_KEY` is
+available, else `stub:transcriber` under `ORGOPS_LLM_STUB=1`, else disabled.
+Keys come from the API process env, falling back to public-scope secrets.
+
+- `GET /api/voice/config` → `{ transcription: { enabled, modelId }, realtime: { enabled, provider } }`
+- `POST /api/voice/transcribe` `{ fileId }` → `{ text, language?, durationInSeconds?, modelId }`
+
+The UI shows hold-to-talk whenever transcription is enabled.
+
+Realtime calls (`apps/api/src/voice-realtime.ts`, `apps/agent-runner/src/realtime-voice.ts`):
+
+1. When a running channel agent has `modelCapabilities.realtimeAudioInput`, the
+   UI offers "Call <agent>". The browser creates a WebRTC offer (mic track +
+   `oai-events` data channel) and posts it to
+   `POST /api/voice/realtime/calls` `{ channelId, agentName, sessionId, sdp }`
+   → `{ sdp, callId, model, agentName }`.
+2. The API checks the caller can post to the channel, the agent is subscribed,
+   `RUNNING`, and on an OpenAI realtime model, resolves `OPENAI_API_KEY` from the
+   agent's secret scopes (falling back to the API env), and forwards the offer
+   plus a base session (agent name, soul, voice `ORGOPS_REALTIME_VOICE` default
+   `marin`, input transcription, near-field noise reduction) to
+   `https://api.openai.com/v1/realtime/calls`. Audio then flows browser ↔
+   OpenAI directly; the API never relays media. It emits
+   `voice.realtime.call.started` with the provider `callId`.
+3. The assigned runner sees the event in its poll (even if a text turn holds
+   the channel), opens the sideband WebSocket
+   `wss://api.openai.com/v1/realtime?call_id=<callId>` with the agent's key,
+   and sends `session.update` with full instructions (soul, channel context,
+   recent history) and the agent's runner tools as JSON Schema functions.
+4. Tool calls from the model run on the runner host with the same tools and
+   filesystem allowlist as text turns; outputs go back as
+   `function_call_output` items followed by `response.create`.
+5. The runner records both sides as `message.created` in speaking order:
+   human speech from input transcription (`source` = the human), agent speech
+   from output audio transcripts (`source` = the agent), each with
+   `payload.voice = { mode: "realtime", callId, sessionId, interrupted? }`.
+   Replies cut off by barge-in carry `interrupted: true`.
+6. Text posted to the channel during a call is injected into the call as a
+   `[channel] <source>: <text>` item instead of starting a text turn. Its
+   attachments are saved into the agent workspace (paths listed in the note)
+   and images (≤5MB, up to 3) are attached as `input_image`.
+7. Provider server VAD handles turn-taking and barge-in natively. The UI shows
+   connecting / listening / you / thinking / agent / tool states and has mic
+   mute, speaker mute, and hang up.
+8. Hanging up (or page close) emits `voice.realtime.call.ended`; the runner
+   then hangs up the provider call and closes the sideband socket. Agent stop
+   and runner shutdown also end active calls.
+
+Outside calls, an agent on an OpenAI realtime model still handles text, voice
+messages, and attachments as normal CLASSIC turns. Realtime models are not
+served by chat completions, so `generate()` in `packages/llm`
+(`openai-realtime.ts`) runs them over the Realtime WebSocket in text mode
+(`output_modalities: ["text"]`), executing tools locally between responses
+and retrying transient `server_error` responses. Memory summarization uses the
+same path. Because these models do not follow the JSON event contract
+reliably, their `replyContract` capability defaults to `plain-text`: the final
+text is posted as the agent's `message.created` reply in the channel
+(`NO_REPLY` posts nothing), and `events_emit` is reserved for other side
+effects.
+
+Presence events (bookkeeping only):
+
+- `voice.session.started` / `voice.session.ended` (also sent on page close)
+- `voice.participant.muted`
+- `voice.active_speaker.changed`
+- `voice.realtime.call.started` / `voice.realtime.call.ended`
 
 ### Billing
 
@@ -596,10 +695,10 @@ Runner loop:
 6. Filter control/audit/self-authored/agent-authored events.
 7. Group remaining pending events by channel and process each channel as a single handling batch.
 8. Execute by agent mode:
-   - `CLASSIC`: call LLM, enforce JSON event output with retries, validate and emit.
+   - `CLASSIC`: call LLM, enforce JSON event output with retries, validate and emit. Models whose `replyContract` capability is `plain-text` instead have their final text posted as the reply (see Models and Realtime Voice).
    - `RLM_REPL`: run recursive REPL loop in child process with explicit `done(result)`.
    - `WRAPPED`: skip orgops memory/prompt/skills/model calls and run the configured external runtime recipe.
-9. For native modes, build context from runner guidance + bounded channel history + skills + `soul_contents`, plus a synthetic merged-trigger message when a batch contains multiple events.
+9. For native modes, build context from runner guidance + bounded channel history + skills + `soul_contents`, plus a synthetic merged-trigger message when a batch contains multiple events. Human message attachments (except voice-note audio) are downloaded once into `<workspace>/.orgops-attachments/<fileId>/<name>` and exposed as `payload.attachments[].localPath`; image attachments are also inlined as image parts.
 10. For native modes, run model generation in step mode (single-step/attempt calls) and poll pending events for the same `(agent, channel)` between attempts; newly arrived events are merged into subsequent attempt context.
 11. On handler failure, call `/api/events/:id/fail` for each event in the failed channel batch.
 
@@ -733,7 +832,7 @@ Security note: wrapped `source`, `setup.command`, and `runtime.command` are host
 - `ORGOPS_SKILL_ROOTS` (optional comma-separated additional skill roots; repo `skills/` remains first)
 - `ORGOPS_LLM_STUB`
 - `ORGOPS_LLM_CALL_TIMEOUT_MS`
-- `ORGOPS_HISTORY_MAX_EVENTS`, `ORGOPS_HISTORY_MAX_CHARS`
+- `ORGOPS_HISTORY_MAX_EVENTS`, `ORGOPS_HISTORY_MAX_CHARS` (ceilings; the per-turn history char budget is half the model context window minus the system prompt and memory context, ~4 chars/token, floored at 8k chars)
 - `ORGOPS_CHANNEL_RECENT_MEMORY_INTERVAL_MS`
 - `ORGOPS_CHANNEL_FULL_MEMORY_INTERVAL_MS`
 - `ORGOPS_CROSS_RECENT_MEMORY_INTERVAL_MS`
@@ -841,3 +940,12 @@ bytes through the authenticated file API, and returns `attachment` metadata and
 a download URL. It does not publish a message: include the returned object in
 `message.created.payload.attachments` via `events_emit` to share it. Wrapped
 external runtimes do not automatically receive native runner tools.
+
+Audio uploads (`.mp3`, `.wav`, `.ogg`/`.opus`, `.m4a`, `.aac`, `.flac`,
+`.webm`) carry an `audio/*` mime, which the user UI renders as an inline voice
+message player. The bundled `speak` skill uses this so text-only agents can
+reply with speech: `skills/speak/assets/speak.ts` calls OpenAI text-to-speech
+(`ORGOPS_TTS_MODEL`, default `gpt-4o-mini-tts`; `ORGOPS_TTS_VOICE`, default
+`marin`) with the agent's injected `OPENAI_API_KEY`, the agent uploads the file
+with `fs_upload`, and posts it with the spoken text. The skill tells agents to
+answer in voice when the human's message carries `payload.voice`.

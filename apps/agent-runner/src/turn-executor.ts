@@ -14,6 +14,8 @@ import {
   type EventValidationResult,
   type EventTypeSummary,
   getCoreEventShapes,
+  inferModelCapabilities,
+  resolveReplyContract,
   serializeEventShapes,
   validateEventAgainstShapes,
 } from "@orgops/schemas";
@@ -21,7 +23,7 @@ import { createRunnerTools, executeTool } from "./tools";
 import { pullInjectedEventMessages } from "./channel-injection";
 import { shouldHandleEventForAgent } from "./event-routing";
 import { getReservedEventTypeError } from "./event-type-guard";
-import { buildRunnerGuidance } from "./prompt";
+import { buildRunnerGuidance, PLAIN_TEXT_NO_REPLY } from "./prompt";
 import { runRlmEventInChild } from "./rlm-process";
 import { runWrappedAgentTurn } from "./wrapped-runtime";
 import {
@@ -36,6 +38,7 @@ import {
 } from "./context-maintenance";
 import {
   buildModelMessages,
+  computeHistoryBudgetChars,
   contentCharLength,
   contentForTelemetry,
   estimateContextUsage,
@@ -299,6 +302,12 @@ function normalizeModelMetadataProvider(provider: string) {
   return normalized;
 }
 
+function inferModelCapabilitiesForId(modelId: string) {
+  const separator = modelId.indexOf(":");
+  if (separator <= 0) return {};
+  return inferModelCapabilities(modelId.slice(0, separator), modelId.slice(separator + 1));
+}
+
 function resolveFallbackModelContextWindowTokens(modelId: string): number {
   const normalized = modelId.toLowerCase();
   if (normalized.includes("gpt-4o-mini")) return 128_000;
@@ -310,7 +319,12 @@ function resolveFallbackModelContextWindowTokens(modelId: string): number {
   return FALLBACK_MODEL_CONTEXT_WINDOW_TOKENS;
 }
 
-async function resolveModelContextWindowTokens(modelId: string): Promise<number> {
+async function resolveModelContextWindowTokens(agent: Agent): Promise<number> {
+  const declared = agent.modelCapabilities?.contextWindowTokens;
+  if (typeof declared === "number" && declared > 0) return Math.floor(declared);
+  const inferred = inferModelCapabilitiesForId(agent.modelId).contextWindowTokens;
+  if (inferred) return inferred;
+  const modelId = agent.modelId;
   const cached = modelContextWindowCache.get(modelId);
   if (cached) return cached;
   const pending = (async () => {
@@ -541,6 +555,8 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       .join("\n\n");
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
+    const plainTextReplies =
+      resolveReplyContract(agent.modelId, agent.modelCapabilities) === "plain-text";
     const runnerGuidance = buildRunnerGuidance(
       nowMs,
       nowIso,
@@ -554,6 +570,7 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         shell: process.env.SHELL ?? process.env.ComSpec ?? "unknown",
         nodeVersion: process.version,
       },
+      { replyContract: plainTextReplies ? "plain-text" : "json" },
     );
     const memoryContextMode = resolveAgentMemoryContextMode(agent);
     let eventHistory: Event[] = [];
@@ -632,9 +649,16 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
     ]
       .filter(Boolean)
       .join("\n\n");
+    const contextWindowTokens = await resolveModelContextWindowTokens(agent);
+    const historyMaxChars = computeHistoryBudgetChars({
+      contextWindowTokens,
+      system,
+      systemContextMessages,
+    });
     const baseMessages = await buildModelMessages(agent, system, eventHistory, {
       systemContextMessages,
       apiFetch: input.api.apiFetch,
+      historyMaxChars,
     });
     const mergedTriggerMessage =
       events.length > 1
@@ -696,7 +720,6 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       0,
     );
     const estimatedUsedTokens = estimateContextUsage(invokeMessages);
-    const contextWindowTokens = await resolveModelContextWindowTokens(agent.modelId);
     const estimatedAvailableTokens = Math.max(0, contextWindowTokens - estimatedUsedTokens);
     const utilizationPct =
       contextWindowTokens > 0
@@ -719,6 +742,7 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
             systemChars,
             systemContextChars,
             historyChars: Math.max(0, totalPromptChars - systemChars - systemContextChars),
+            historyMaxChars,
             triggerEventId: triggerEvent.id,
             ...payload,
           },
@@ -876,6 +900,24 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         maxAttempts: MAX_EVENT_DISPATCH_ATTEMPTS,
       });
       if (hasLateInjectedEvents) continue;
+      if (plainTextReplies) {
+        const reply = responseText.trim();
+        if (!reply || reply === PLAIN_TEXT_NO_REPLY) {
+          await emitTurnEvent("agent.turn.completed", { noReply: true });
+          return;
+        }
+        if (!/^(\{|```)/.test(reply)) {
+          await input.api.emitEvent({
+            type: "message.created",
+            source: `agent:${agent.name}`,
+            channelId,
+            payload: { text: reply },
+            parentEventId: triggerEvent.id,
+          });
+          await emitTurnEvent("agent.turn.completed", {});
+          return;
+        }
+      }
       let parsed: unknown;
       try {
         parsed = extractJsonObject(responseText);

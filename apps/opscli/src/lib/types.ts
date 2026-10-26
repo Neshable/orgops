@@ -19,7 +19,7 @@ export type AgentRuntimeState = {
   exitCode: number;
 };
 
-export type ModelProvider = "openai" | "anthropic" | "openrouter";
+export type ModelProvider = "openai" | "anthropic" | "openrouter" | "mistral";
 
 export type CliOptions = {
   goal: string | null;

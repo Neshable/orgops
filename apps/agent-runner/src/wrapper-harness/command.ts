@@ -56,6 +56,7 @@ const PROVIDER_SECRET_ENV_KEYS = [
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
   "OPENROUTER_API_KEY",
+  "MISTRAL_API_KEY",
 ] as const;
 
 function wildcardToRegex(pattern: string): RegExp {

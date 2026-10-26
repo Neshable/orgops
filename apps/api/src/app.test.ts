@@ -96,9 +96,11 @@ describe("api app", () => {
     const previousMasterKey = process.env.ORGOPS_MASTER_KEY;
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    const previousMistralKey = process.env.MISTRAL_API_KEY;
     process.env.ORGOPS_MASTER_KEY = masterKey;
     process.env.OPENAI_API_KEY = "sk-test-openai";
     delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.MISTRAL_API_KEY;
 
     try {
       const unconfiguredDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
@@ -209,6 +211,34 @@ describe("api app", () => {
         modelName: "gpt-4o-mini",
         enabled: 1,
       });
+      const mistralDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+      const mistralDb = openDb(":memory:");
+      process.env.MISTRAL_API_KEY = "sk-test-mistral";
+      createApp({
+        db: mistralDb,
+        dataDir: mistralDir,
+        adminUser: "admin",
+        adminPass: "admin",
+        systemAgentModel: "mistral:voxtral-mini-transcribe-realtime-3",
+      });
+      const mistralOrm = createDrizzleDb(mistralDb);
+      const mistralModel = mistralOrm
+        .select({
+          provider: schema.models.provider,
+          modelName: schema.models.model_name,
+          defaultsJson: schema.models.defaults_json,
+        })
+        .from(schema.models)
+        .where(eq(schema.models.id, "mistral:voxtral-mini-transcribe-realtime-3"))
+        .get() as
+        | { provider: string; modelName: string; defaultsJson: string }
+        | undefined;
+      expect(mistralModel?.provider).toBe("mistral");
+      expect(JSON.parse(mistralModel?.defaultsJson ?? "{}").capabilities).toMatchObject({
+        audioInput: true,
+        realtimeAudioInput: true,
+      });
+      rmSync(mistralDir, { recursive: true, force: true });
       rmSync(dataDir, { recursive: true, force: true });
     } finally {
       if (previousMasterKey === undefined) delete process.env.ORGOPS_MASTER_KEY;
@@ -217,6 +247,8 @@ describe("api app", () => {
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
       if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+      if (previousMistralKey === undefined) delete process.env.MISTRAL_API_KEY;
+      else process.env.MISTRAL_API_KEY = previousMistralKey;
     }
   });
 

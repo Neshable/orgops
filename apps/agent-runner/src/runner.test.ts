@@ -10,6 +10,7 @@ import {
   selectRecentDeltaEventsForPrompt,
   shouldHandleEvent,
 } from "./runner";
+import { computeHistoryBudgetChars } from "./prompt-composer";
 import { stopAllRunningProcesses } from "./tools/shell";
 import type { Agent, Event } from "./types";
 
@@ -292,6 +293,46 @@ describe("agent runner", () => {
       .map((message) => JSON.parse(message.content as string).eventId);
     expect(eventIds[0]).toBe("evt-11");
     expect(eventIds[eventIds.length - 1]).toBe("evt-130");
+    expect(truncationMeta.omittedBefore).toBe(11);
+    expect(truncationMeta.howToReadOmitted).toContain('channelId: "chan-1", before: 11');
+  });
+
+  it("sizes the history budget from the model context window", () => {
+    const small = computeHistoryBudgetChars({ contextWindowTokens: 32_000, system: "x".repeat(8_000) });
+    expect(small).toBe((16_000 - 2_000) * 4);
+    const large = computeHistoryBudgetChars({ contextWindowTokens: 1_000_000, system: "sys" });
+    expect(large).toBe(120_000);
+    const tiny = computeHistoryBudgetChars({ contextWindowTokens: 4_000, system: "x".repeat(40_000) });
+    expect(tiny).toBe(8_000);
+  });
+
+  it("trims history to a caller-provided char budget", async () => {
+    const agent: Agent = {
+      name: "tester",
+      workspacePath: "/tmp",
+      modelId: "openai:gpt-realtime",
+      desiredState: "RUNNING",
+      runtimeState: "RUNNING",
+    };
+    const events: Event[] = Array.from({ length: 50 }, (_, index) => ({
+      id: `evt-${index + 1}`,
+      type: "message.created",
+      payload: { text: "y".repeat(1_000) },
+      source: "human:alice",
+      channelId: "chan-1",
+      createdAt: index + 1,
+    }));
+    const messages = await buildModelMessages(agent, "system prompt", events, {
+      historyMaxChars: 10_000,
+    });
+    const truncationMeta = JSON.parse(String(messages[1]?.content));
+    expect(truncationMeta.limits.maxChars).toBe(10_000);
+    expect(truncationMeta.includedCount).toBeLessThan(events.length);
+    expect(messages.length - 2).toBe(truncationMeta.includedCount);
+    const keptChars = messages
+      .slice(2)
+      .reduce((sum, message) => sum + String(message.content).length, 0);
+    expect(keptChars).toBeLessThanOrEqual(10_000);
   });
 
   it("omits latest user-like event from recent delta system context", () => {
