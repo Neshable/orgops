@@ -1,6 +1,6 @@
 ---
 name: agent-management
-description: Create, list, and configure OrgOps agents from native agents. Use when the user asks an agent to create agents, list agents, set up WRAPPED agents, OpenClaw wrappers, sidecars, or Cursor coding harnesses.
+description: Create, list, and configure OrgOps agents from native agents. Use when the user asks an agent to create agents, list agents, set up WRAPPED agents, OpenClaw wrappers, sidecars, Cursor coding harnesses, or Claude Code agents.
 ---
 
 # Agent Management
@@ -57,6 +57,8 @@ For a wrapped agent, set:
 - a `wrappedConfig` object with `kind`, `harness`, optional `setup`, optional `sidecars`, and `runtime`
 
 Wrapped agents do not use OrgOps model calls, prompts, memory, skills, or `allowOutsideWorkspace` for turns. The external runtime owns its session, tools, memory, prompt behavior, and filesystem policy through its own settings.
+
+For Claude Code (the `claude` CLI), follow the `claude-code` skill: it ships the glue script and the recipe. Enable it on the agent doing the setup, not on the wrapped agent.
 
 ## Update Existing Agents
 
