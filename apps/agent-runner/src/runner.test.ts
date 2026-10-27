@@ -297,6 +297,25 @@ describe("agent runner", () => {
     expect(truncationMeta.howToReadOmitted).toContain('channelId: "chan-1", before: 11');
   });
 
+  it("gives plain-text agents conversational roles for agent messages", async () => {
+    const agent: Agent = {
+      name: "voice-agent",
+      workspacePath: "/tmp",
+      modelId: "openai:gpt-realtime",
+      desiredState: "RUNNING",
+      runtimeState: "RUNNING",
+    };
+    const events: Event[] = [
+      { id: "e1", type: "message.created", source: "human:admin", channelId: "c", payload: { text: "hi" }, createdAt: 1 },
+      { id: "e2", type: "message.created", source: "agent:voice-agent", channelId: "c", payload: { text: "Hello!" }, createdAt: 2 },
+      { id: "e3", type: "message.created", source: "agent:voice-agent-2", channelId: "c", payload: { text: "Me too" }, createdAt: 3 },
+    ];
+    const messages = await buildModelMessages(agent, "system prompt", events);
+    expect(messages.slice(1).map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+    expect(messages[2]?.content).toBe("Hello!");
+    expect(JSON.parse(String(messages[3]?.content)).source).toBe("agent:voice-agent-2");
+  });
+
   it("sizes the history budget from the model context window", () => {
     const small = computeHistoryBudgetChars({ contextWindowTokens: 32_000, system: "x".repeat(8_000) });
     expect(small).toBe((16_000 - 2_000) * 4);

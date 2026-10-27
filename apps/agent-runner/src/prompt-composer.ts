@@ -4,6 +4,7 @@ import type {
   LlmMessageContent,
   LlmTextPart,
 } from "@orgops/llm";
+import { resolveReplyContract } from "@orgops/schemas";
 import {
   isWorkspaceAttachment,
   readMessageAttachments,
@@ -202,6 +203,18 @@ export async function toHistoryMessage(
     attachmentCache?: Map<string, Promise<AttachmentImageData | null>>;
   },
 ): Promise<LlmMessage> {
+  const agentMessage =
+    event.type === "message.created" && String(event.source ?? "").startsWith("agent:");
+  if (agentMessage && resolveReplyContract(agent.modelId, agent.modelCapabilities) === "plain-text") {
+    // Plain-text models treat system items as instructions and echo them, so replies need
+    // conversational roles: their own as assistant turns, other agents as attributed user turns.
+    if (event.source === `agent:${agent.name}`) {
+      const text = (event.payload as { text?: unknown } | undefined)?.text;
+      if (typeof text === "string" && text.trim()) return { role: "assistant", content: text };
+    } else {
+      return { role: "user", content: JSON.stringify(buildPromptEventRecord(event), null, 2) };
+    }
+  }
   const role = isUserMessageEvent(event) ? ("user" as const) : ("system" as const);
   if (role !== "user" || !options?.apiFetch) {
     return { role, content: JSON.stringify(buildPromptEventRecord(event), null, 2) };
