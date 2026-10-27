@@ -695,7 +695,7 @@ Runner loop:
 6. Filter control/audit/self-authored/agent-authored events.
 7. Group remaining pending events by channel and process each channel as a single handling batch.
 8. Execute by agent mode:
-   - `CLASSIC`: call LLM, enforce JSON event output with retries, validate and emit. Models whose `replyContract` capability is `plain-text` instead have their final text posted as the reply (see Models and Realtime Voice).
+   - `CLASSIC`: call LLM, enforce JSON event output with retries, validate and emit. Models whose `replyContract` capability is `plain-text` instead have their final text posted as the reply (see Models and Realtime Voice). Because they rarely stay silent, plain-text agents are only woken by another agent's `message.created` when it addresses them (`@name` mention, `targetAgentName`, or `targetAgentNames`), and their history renders their own replies as `assistant` turns and other agents' messages as attributed `user` turns instead of `system` records.
    - `RLM_REPL`: run recursive REPL loop in child process with explicit `done(result)`.
    - `WRAPPED`: skip orgops memory/prompt/skills/model calls and run the configured external runtime recipe.
 9. For native modes, build context from runner guidance + bounded channel history + skills + `soul_contents`, plus a synthetic merged-trigger message when a batch contains multiple events. Human message attachments (except voice-note audio) are downloaded once into `<workspace>/.orgops-attachments/<fileId>/<name>` and exposed as `payload.attachments[].localPath`; image attachments are also inlined as image parts.
