@@ -42,8 +42,10 @@ describe("buildRunnerGuidance", () => {
     };
     const guidance = buildRunnerGuidance(1, "1970-01-01T00:00:00.001Z", [], [], host, {
       replyContract: "plain-text",
+      agentName: "voice-agent",
     });
 
+    expect(guidance).toContain("You are the agent `voice-agent`");
     expect(guidance).toContain("your final answer is plain text");
     expect(guidance).toContain("call the `noop` tool");
     expect(guidance).not.toContain("MUST be JSON");

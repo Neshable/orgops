@@ -478,7 +478,13 @@ reliably, their `replyContract` capability defaults to `plain-text`: the final
 text is posted as the agent's `message.created` reply in the channel
 (calling the `noop` tool ends the turn without posting), and `events_emit` is
 reserved for other side effects. `noop` has no `execute`, so both the AI SDK
-and the realtime loop stop on it and return the call to the runner.
+and the realtime loop stop on it and return the call to the runner. If the
+model posts to the current channel through `events_emit` anyway, its final
+text is not posted a second time.
+
+Runner guidance names the agent (``You are the agent `name` ``) and its own
+`agent:<name>` source, so agents can tell their messages from other
+participants'.
 
 In every agent's prompt history, its own `message.created` events are
 `assistant` turns (plain text for plain-text agents, the event JSON otherwise)

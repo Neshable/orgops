@@ -569,7 +569,7 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         shell: process.env.SHELL ?? process.env.ComSpec ?? "unknown",
         nodeVersion: process.version,
       },
-      { replyContract: plainTextReplies ? "plain-text" : "json" },
+      { replyContract: plainTextReplies ? "plain-text" : "json", agentName: agent.name },
     );
     const memoryContextMode = resolveAgentMemoryContextMode(agent);
     let eventHistory: Event[] = [];
@@ -781,11 +781,24 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
     if (loadedSkillEventShapes.errors.length > 0) {
       console.warn("skill event shape load errors", loadedSkillEventShapes.errors);
     }
+    let postedMessageToChannel = false;
     const runnerTools = createRunnerTools({
       agent,
       event: triggerEvent,
       channelId,
-      runTool: (tool, args) => executeTool(executeCtx, tool, args),
+      runTool: async (tool, args) => {
+        const output = await executeTool(executeCtx, tool, args);
+        const emitted = output as { channelId?: unknown; event?: { type?: unknown; deliverAt?: unknown } };
+        if (
+          tool === "events_emit" &&
+          emitted?.channelId === channelId &&
+          emitted.event?.type === "message.created" &&
+          !emitted.event.deliverAt
+        ) {
+          postedMessageToChannel = true;
+        }
+        return output;
+      },
       apiFetch: input.api.apiFetch,
       emitEvent: input.api.emitEvent,
     });
@@ -906,6 +919,11 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         );
         if (calledNoop || !reply) {
           await emitTurnEvent("agent.turn.completed", { noReply: true });
+          return;
+        }
+        // The model already replied here via events_emit; posting its final text too would duplicate it.
+        if (postedMessageToChannel) {
+          await emitTurnEvent("agent.turn.completed", {});
           return;
         }
         if (!/^(\{|```)/.test(reply)) {

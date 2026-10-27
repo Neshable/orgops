@@ -45,7 +45,7 @@ export function buildRunnerGuidance(
   skillRootPaths: string[],
   coreEventTypes: EventTypeSummary[],
   hostInfo: RunnerHostInfo,
-  options: { replyContract?: "json" | "plain-text" } = {},
+  options: { replyContract?: "json" | "plain-text"; agentName?: string } = {},
 ) {
   const skillRootsText =
     skillRootPaths.length > 0 ? skillRootPaths.join(", ") : "(none configured)";
@@ -70,6 +70,11 @@ export function buildRunnerGuidance(
           "- Do not include markdown or prose outside of JSON.",
         ];
   return [
+    ...(options.agentName
+      ? [
+          `- You are the agent \`${options.agentName}\`. Your own messages have source \`agent:${options.agentName}\`; every other source is a different participant.`,
+        ]
+      : []),
     "- You are running inside OrgOps' agent-runner and receive events per channels.",
     "- The runner executes your tool calls on the agent-runner's host machine.",
     "- The runner does not orchestrate your collaboration.",
