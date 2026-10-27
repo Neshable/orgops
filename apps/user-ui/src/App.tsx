@@ -511,6 +511,19 @@ function participantAgentStatus(participant: ChannelParticipant, agents: Agent[]
   return agent?.runtimeState === "RUNNING" ? "running" : "off";
 }
 
+const COMPOSER_MIN_HEIGHT = 56;
+const COMPOSER_MAX_VIEWPORT_SHARE = 0.6;
+const COMPOSER_HEIGHT_STORAGE_KEY = "orgops.user-ui.composerHeight";
+
+function readStoredComposerHeight(): number | null {
+  try {
+    const stored = Number(window.localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY));
+    return Number.isFinite(stored) && stored >= COMPOSER_MIN_HEIGHT ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
 function agentSupportsVoiceInput(agent?: Agent) {
   const capabilities = agent?.modelCapabilities;
   return Boolean(capabilities?.audioInput || capabilities?.realtimeAudioInput);
@@ -868,6 +881,8 @@ export default function App() {
   const messagesPanelRef = useRef<HTMLElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerUserHeightRef = useRef<number | null>(readStoredComposerHeight());
+  const [composerResizing, setComposerResizing] = useState(false);
   const voiceRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceStreamRef = useRef<MediaStream | null>(null);
   const voiceChunksRef = useRef<Blob[]>([]);
@@ -3138,18 +3153,66 @@ export default function App() {
     event.currentTarget.value = "";
   }
 
+  function composerMaxHeight() {
+    return isConversationEmpty
+      ? Math.max(56, Math.floor(window.innerHeight / 8))
+      : Math.max(COMPOSER_MIN_HEIGHT, Math.floor(window.innerHeight * COMPOSER_MAX_VIEWPORT_SHARE));
+  }
+
   function resizeComposerTextarea(textarea?: HTMLTextAreaElement | null) {
     const target = textarea ?? composerTextareaRef.current;
     if (!target) return;
-    const viewportMax = isConversationEmpty
-      ? Math.max(56, Math.floor(window.innerHeight / 8))
-      : Math.max(120, Math.floor(window.innerHeight / 3));
-    const minHeight = isConversationEmpty ? 34 : 56;
-    target.style.maxHeight = `${viewportMax}px`;
-    target.style.height = "auto";
-    const nextHeight = Math.min(target.scrollHeight, viewportMax);
-    target.style.height = `${Math.max(minHeight, nextHeight)}px`;
-    target.style.overflowY = target.scrollHeight > viewportMax ? "auto" : "hidden";
+    const maxHeight = composerMaxHeight();
+    target.style.maxHeight = "";
+    target.style.minHeight = "";
+    // Collapse to measure content; the textarea otherwise stretches to fill the composer row.
+    target.style.height = "0px";
+    const contentHeight = target.scrollHeight;
+    target.style.height = "";
+    const floor = isConversationEmpty ? 34 : Math.max(COMPOSER_MIN_HEIGHT, composerUserHeightRef.current ?? 0);
+    target.style.minHeight = `${Math.min(maxHeight, Math.max(floor, contentHeight))}px`;
+    target.style.maxHeight = `${maxHeight}px`;
+    target.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
+  }
+
+  function setComposerUserHeight(height: number | null) {
+    composerUserHeightRef.current =
+      height === null ? null : Math.round(Math.min(composerMaxHeight(), Math.max(COMPOSER_MIN_HEIGHT, height)));
+    try {
+      if (composerUserHeightRef.current === null) window.localStorage.removeItem(COMPOSER_HEIGHT_STORAGE_KEY);
+      else window.localStorage.setItem(COMPOSER_HEIGHT_STORAGE_KEY, String(composerUserHeightRef.current));
+    } catch {
+      // Storage can be unavailable (private mode); the height still applies for this session.
+    }
+    resizeComposerTextarea();
+  }
+
+  function startComposerResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    const textarea = composerTextareaRef.current;
+    if (!textarea) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    try {
+      handle.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer already released; the drag simply ends on the next pointerup.
+    }
+    const startY = event.clientY;
+    const startHeight = textarea.getBoundingClientRect().height;
+    setComposerResizing(true);
+    const onMove = (moveEvent: PointerEvent) => {
+      setComposerUserHeight(startHeight + (startY - moveEvent.clientY));
+    };
+    const onEnd = () => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onEnd);
+      handle.removeEventListener("pointercancel", onEnd);
+      setComposerResizing(false);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onEnd);
+    handle.addEventListener("pointercancel", onEnd);
   }
 
   function handleComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
@@ -3855,7 +3918,28 @@ export default function App() {
             </button>
           ) : null}
 
-          <form className={`composer${isConversationEmpty ? " composer-compact" : ""}`} onSubmit={handleSubmit}>
+          <form
+            className={`composer${isConversationEmpty ? " composer-compact" : ""}${composerResizing ? " is-resizing" : ""}`}
+            onSubmit={handleSubmit}
+          >
+          {!isConversationEmpty ? (
+            <div
+              className="composer-resize-handle"
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="Resize message box"
+              tabIndex={0}
+              title="Drag to resize. Double-click to reset."
+              onPointerDown={startComposerResize}
+              onDoubleClick={() => setComposerUserHeight(null)}
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+                event.preventDefault();
+                const current = composerTextareaRef.current?.getBoundingClientRect().height ?? COMPOSER_MIN_HEIGHT;
+                setComposerUserHeight(current + (event.key === "ArrowUp" ? 24 : -24));
+              }}
+            />
+          ) : null}
           <input
             ref={fileInputRef}
             type="file"

@@ -2169,6 +2169,54 @@ button {
   box-shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
 }
 
+.composer {
+  position: relative;
+}
+
+.composer-resize-handle {
+  position: absolute;
+  top: -6px;
+  left: 24px;
+  right: 24px;
+  z-index: 2;
+  height: 14px;
+  cursor: ns-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.composer-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  width: 44px;
+  height: 5px;
+  border-radius: 999px;
+  background: #cbd5e1;
+  opacity: 0;
+  transform: translateX(-50%);
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.composer:hover .composer-resize-handle::after,
+.composer-resize-handle:focus-visible::after {
+  opacity: 1;
+}
+
+.composer-resize-handle:hover::after,
+.composer-resize-handle:focus-visible::after,
+.composer.is-resizing .composer-resize-handle::after {
+  opacity: 1;
+  background: #0f766e;
+}
+
+.composer.is-resizing,
+.composer.is-resizing * {
+  cursor: ns-resize !important;
+  user-select: none;
+}
+
 .composer-compact {
   width: 100%;
   max-width: none;
@@ -2252,10 +2300,10 @@ button {
 }
 
 .composer textarea {
+  align-self: stretch;
   width: 100%;
   min-height: 56px;
-  max-height: 33vh;
-  resize: vertical;
+  resize: none;
   border: 0;
   outline: none;
   color: #0f172a;
@@ -3309,6 +3357,10 @@ button {
   .message,
   .trace-group {
     max-width: 100%;
+  }
+
+  .composer-resize-handle {
+    display: none;
   }
 
   .composer {
