@@ -28,7 +28,6 @@ import { buildRunnerGuidance, NOOP_TOOL_NAME } from "./prompt";
 import { runRlmEventInChild } from "./rlm-process";
 import { runWrappedAgentTurn } from "./wrapped-runtime";
 import {
-  buildChannelRecentDeltaSystemMessage,
   buildSystemMemoryMessage,
   getChannelFullMemoryRecord,
   getChannelRecentMemoryRecord,
@@ -43,7 +42,6 @@ import {
   contentCharLength,
   contentForTelemetry,
   estimateContextUsage,
-  selectRecentDeltaEventsForPrompt,
 } from "./prompt-composer";
 import { recordLlmUsage } from "./billing";
 import type { Agent, Event } from "./types";
@@ -593,22 +591,12 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
           : undefined,
       );
       eventHistory = getMeaningfulEvents(rawDeltaEvents);
-      const recentDeltaForSystemContext = selectRecentDeltaEventsForPrompt(
-        agent,
-        eventHistory,
-      );
       systemContextMessages = [
         channelRecentMemory?.summaryText
           ? buildSystemMemoryMessage(
               `Channel Recent Summary (last 10 minutes, ${channelId})`,
               channelRecentMemory.summaryText,
             )
-          : "",
-        recentDeltaForSystemContext.length > 0
-          ? buildChannelRecentDeltaSystemMessage({
-              channelId,
-              events: recentDeltaForSystemContext,
-            })
           : "",
         channelFullMemory?.summaryText
           ? buildSystemMemoryMessage(

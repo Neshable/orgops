@@ -402,17 +402,3 @@ export async function buildModelMessages(
     ...keptFromEnd,
   ];
 }
-
-export function selectRecentDeltaEventsForPrompt(agent: Agent, events: Event[]): Event[] {
-  const ownSource = `agent:${agent.name}`;
-  let latestUserLikeEventId: string | undefined;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event?.source !== ownSource) {
-      latestUserLikeEventId = event?.id;
-      break;
-    }
-  }
-  if (!latestUserLikeEventId) return events;
-  return events.filter((event) => event.id !== latestUserLikeEventId);
-}

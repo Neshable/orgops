@@ -7,7 +7,6 @@ import {
   resolveAgentClassicMaxModelSteps,
   resolveAgentMemoryContextMode,
   resolveAgentLlmCallTimeoutMs,
-  selectRecentDeltaEventsForPrompt,
   shouldHandleEvent,
 } from "./runner";
 import { computeHistoryBudgetChars } from "./prompt-composer";
@@ -361,42 +360,6 @@ describe("agent runner", () => {
       .slice(2)
       .reduce((sum, message) => sum + String(message.content).length, 0);
     expect(keptChars).toBeLessThanOrEqual(10_000);
-  });
-
-  it("omits latest user-like event from recent delta system context", () => {
-    const agent: Agent = {
-      name: "tester",
-      workspacePath: "/tmp",
-      modelId: "openai:gpt-4o-mini",
-      desiredState: "RUNNING",
-      runtimeState: "RUNNING",
-    };
-    const events: Event[] = [
-      {
-        id: "evt-1",
-        type: "message.created",
-        payload: { text: "first user" },
-        source: "human:alice",
-        channelId: "chan-1",
-      },
-      {
-        id: "evt-2",
-        type: "message.created",
-        payload: { text: "self response" },
-        source: "agent:tester",
-        channelId: "chan-1",
-      },
-      {
-        id: "evt-3",
-        type: "process.output",
-        payload: { text: "latest user-like external update" },
-        source: "system:process-runner",
-        channelId: "chan-1",
-      },
-    ];
-
-    const filtered = selectRecentDeltaEventsForPrompt(agent, events);
-    expect(filtered.map((event) => event.id)).toEqual(["evt-1", "evt-2"]);
   });
 
   it("injects memory summaries as system messages", async () => {

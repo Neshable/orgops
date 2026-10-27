@@ -29,7 +29,7 @@ import {
   stopAllWrappedRuntimes,
   stopWrappedAgentRuntime,
 } from "./wrapped-runtime";
-import { buildModelMessages, selectRecentDeltaEventsForPrompt } from "./prompt-composer";
+import { buildModelMessages } from "./prompt-composer";
 import { createWorkspacePublicationSync } from "./workspace-publication-sync";
 import { createRealtimeVoiceManager } from "./realtime-voice";
 import type { Agent, Event } from "./types";
@@ -446,5 +446,4 @@ export {
   resolveAgentClassicMaxModelSteps,
   resolveAgentLlmCallTimeoutMs,
   resolveAgentMemoryContextMode,
-  selectRecentDeltaEventsForPrompt,
 };
