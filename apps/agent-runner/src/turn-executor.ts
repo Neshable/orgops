@@ -9,6 +9,7 @@ import {
   type LlmUsage,
 } from "@orgops/llm";
 import { getModel } from "models-dev-db";
+import { z } from "zod";
 import { listSkillsFromRoots, loadSkillEventShapes } from "@orgops/skills";
 import {
   type EventValidationResult,
@@ -23,7 +24,7 @@ import { createRunnerTools, executeTool } from "./tools";
 import { pullInjectedEventMessages } from "./channel-injection";
 import { shouldHandleEventForAgent } from "./event-routing";
 import { getReservedEventTypeError } from "./event-type-guard";
-import { buildRunnerGuidance, PLAIN_TEXT_NO_REPLY } from "./prompt";
+import { buildRunnerGuidance, NOOP_TOOL_NAME } from "./prompt";
 import { runRlmEventInChild } from "./rlm-process";
 import { runWrappedAgentTurn } from "./wrapped-runtime";
 import {
@@ -792,7 +793,7 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
     if (loadedSkillEventShapes.errors.length > 0) {
       console.warn("skill event shape load errors", loadedSkillEventShapes.errors);
     }
-    const tools = createRunnerTools({
+    const runnerTools = createRunnerTools({
       agent,
       event: triggerEvent,
       channelId,
@@ -800,6 +801,16 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       apiFetch: input.api.apiFetch,
       emitEvent: input.api.emitEvent,
     });
+    const tools = plainTextReplies
+      ? {
+          ...runnerTools,
+          // No execute: the model loop stops on this call and the runner ends the turn silently.
+          [NOOP_TOOL_NAME]: {
+            description: "Finish your turn without posting a reply.",
+            inputSchema: z.object({ reason: z.string().optional() }),
+          },
+        }
+      : runnerTools;
     if ((agent.mode ?? "CLASSIC") === "RLM_REPL") {
       await runRlmEventInChild({
         agent,
@@ -902,7 +913,10 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       if (hasLateInjectedEvents) continue;
       if (plainTextReplies) {
         const reply = responseText.trim();
-        if (!reply || reply === PLAIN_TEXT_NO_REPLY) {
+        const calledNoop = (result.toolCalls ?? []).some(
+          (call) => (call as { toolName?: unknown }).toolName === NOOP_TOOL_NAME,
+        );
+        if (calledNoop || !reply) {
           await emitTurnEvent("agent.turn.completed", { noReply: true });
           return;
         }

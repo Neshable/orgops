@@ -136,6 +136,23 @@ describe("generateWithOpenAIRealtime", () => {
     expect(output.item.output).toContain("Invalid tool arguments for fs_list");
   });
 
+  it("stops on a call to a tool without execute and returns it", async () => {
+    const fake = createFakeRealtime([
+      { status: "completed", output: [{ type: "function_call", call_id: "n", name: "noop", arguments: '{"reason":"not for me"}' }] },
+    ]);
+    const result = await generateWithOpenAIRealtime(
+      "gpt-realtime",
+      undefined,
+      [{ role: "user", content: "hi" }],
+      { apiKey: "k", maxSteps: 4, tools: { noop: { inputSchema: z.object({ reason: z.string().optional() }) } } },
+      { connect: fake.connect, toolJsonSchema },
+    );
+    expect(result.toolCalls).toEqual([{ toolCallId: "n", toolName: "noop", input: '{"reason":"not for me"}' }]);
+    expect(result.finishReason).toBe("tool-calls");
+    expect(fake.sent.filter((message) => message.type === "response.create")).toHaveLength(1);
+    expect(fake.sent.some((message) => message.item?.type === "function_call_output")).toBe(false);
+  });
+
   it("retries transient server errors", async () => {
     const fake = createFakeRealtime([
       { status: "failed", status_details: { error: { type: "server_error", message: "try again" } } },

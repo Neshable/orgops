@@ -65,21 +65,6 @@ describe("event routing", () => {
     ).toBe(true);
   });
 
-  it("only wakes plain-text agents on agent messages that address them", () => {
-    const realtime: Agent = { ...agent, name: "voice-agent", modelId: "openai:gpt-realtime" };
-    const fromAgent = (payload: Record<string, unknown>) =>
-      makeEvent({ type: "message.created", source: "agent:voice-agent-2", payload });
-    expect(shouldHandleEventForAgent(realtime, fromAgent({ text: "I can hear you!" }))).toBe(false);
-    expect(shouldHandleEventForAgent(realtime, fromAgent({ text: "@voice-agent-2 over to you" }))).toBe(false);
-    expect(shouldHandleEventForAgent(realtime, fromAgent({ text: "Hey @Voice-Agent, your turn" }))).toBe(true);
-    expect(
-      shouldHandleEventForAgent(realtime, fromAgent({ text: "ping", targetAgentName: "voice-agent" })),
-    ).toBe(true);
-    expect(
-      shouldHandleEventForAgent(realtime, makeEvent({ type: "message.created", source: "human:admin", payload: { text: "hi" } })),
-    ).toBe(true);
-  });
-
   it("only handles scheduled triggers for the target agent", () => {
     expect(
       shouldHandleEventForAgent(

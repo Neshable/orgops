@@ -45,7 +45,7 @@ describe("buildRunnerGuidance", () => {
     });
 
     expect(guidance).toContain("your final answer is plain text");
-    expect(guidance).toContain("answer with exactly NO_REPLY");
+    expect(guidance).toContain("call the `noop` tool");
     expect(guidance).not.toContain("MUST be JSON");
     expect(guidance).not.toContain("prose outside of JSON");
   });

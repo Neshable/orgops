@@ -476,8 +476,14 @@ and retrying transient `server_error` responses. Memory summarization uses the
 same path. Because these models do not follow the JSON event contract
 reliably, their `replyContract` capability defaults to `plain-text`: the final
 text is posted as the agent's `message.created` reply in the channel
-(`NO_REPLY` posts nothing), and `events_emit` is reserved for other side
-effects.
+(calling the `noop` tool ends the turn without posting), and `events_emit` is
+reserved for other side effects. `noop` has no `execute`, so both the AI SDK
+and the realtime loop stop on it and return the call to the runner.
+
+In every agent's prompt history, its own `message.created` events are
+`assistant` turns (plain text for plain-text agents, the event JSON otherwise)
+and messages from humans or other agents are `user` turns carrying the sender
+in `source`; other events stay `system` records.
 
 Presence events (bookkeeping only):
 
@@ -695,7 +701,7 @@ Runner loop:
 6. Filter control/audit/self-authored/agent-authored events.
 7. Group remaining pending events by channel and process each channel as a single handling batch.
 8. Execute by agent mode:
-   - `CLASSIC`: call LLM, enforce JSON event output with retries, validate and emit. Models whose `replyContract` capability is `plain-text` instead have their final text posted as the reply (see Models and Realtime Voice). Because they rarely stay silent, plain-text agents are only woken by another agent's `message.created` when it addresses them (`@name` mention, `targetAgentName`, or `targetAgentNames`), and their history renders their own replies as `assistant` turns and other agents' messages as attributed `user` turns instead of `system` records.
+   - `CLASSIC`: call LLM, enforce JSON event output with retries, validate and emit. Models whose `replyContract` capability is `plain-text` instead have their final text posted as the reply (see Models and Realtime Voice).
    - `RLM_REPL`: run recursive REPL loop in child process with explicit `done(result)`.
    - `WRAPPED`: skip orgops memory/prompt/skills/model calls and run the configured external runtime recipe.
 9. For native modes, build context from runner guidance + bounded channel history + skills + `soul_contents`, plus a synthetic merged-trigger message when a batch contains multiple events. Human message attachments (except voice-note audio) are downloaded once into `<workspace>/.orgops-attachments/<fileId>/<name>` and exposed as `payload.attachments[].localPath`; image attachments are also inlined as image parts.

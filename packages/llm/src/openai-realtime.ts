@@ -302,6 +302,15 @@ export async function generateWithOpenAIRealtime(
         .filter((call) => call.callId && call.name);
       if (response.status === "incomplete") finishReason = "length";
       if (calls.length === 0) break;
+      // Like the AI SDK: a call to a tool without execute ends the loop and is returned to the caller.
+      const terminalCalls = calls.filter((call) => tools[call.name] && !tools[call.name]?.execute);
+      if (terminalCalls.length > 0) {
+        for (const call of terminalCalls) {
+          toolCalls.push({ toolCallId: call.callId, toolName: call.name, input: call.arguments });
+        }
+        finishReason = "tool-calls";
+        break;
+      }
       for (const call of calls) {
         const result = await runTool(tools[call.name], call.name, call.arguments);
         toolCalls.push({ toolCallId: call.callId, toolName: call.name, input: call.arguments });

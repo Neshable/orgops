@@ -1,6 +1,6 @@
 import type { EventTypeSummary } from "@orgops/schemas";
 
-export const PLAIN_TEXT_NO_REPLY = "NO_REPLY";
+export const NOOP_TOOL_NAME = "noop";
 
 export type RunnerHostInfo = {
   platform: string;
@@ -53,7 +53,7 @@ export function buildRunnerGuidance(
     options.replyContract === "plain-text"
       ? [
           "- Reply contract: your final answer is plain text. The runner posts it to the current channel as your `message.created` reply. Write only what you want to say; no JSON.",
-          `- If no reply is needed, answer with exactly ${PLAIN_TEXT_NO_REPLY}.`,
+          `- When you should not reply, call the \`${NOOP_TOOL_NAME}\` tool instead of writing text: the message is not for you, someone already answered it, or it only acknowledges or greets. Never reply to another agent just to acknowledge it.`,
           "- Never call `events_emit` to post your reply in the current channel. Use `events_emit` only for other side effects: other channels, scheduled events, or non-message event types.",
           "- Use event types that validate against available schemas (core + enabled skills) when you call `events_emit`.",
           "- Do not guess payload shapes.",

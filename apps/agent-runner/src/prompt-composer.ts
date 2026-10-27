@@ -47,10 +47,23 @@ type AttachmentImageData = {
 
 type ApiFetchFn = (path: string, init?: RequestInit) => Promise<Response>;
 
-function isUserMessageEvent(event: Event): boolean {
+/** Chat messages from anyone else (humans or other agents) are conversation turns, not instructions. */
+function isUserMessageEvent(agent: Agent, event: Event): boolean {
   if (event.type !== "message.created") return false;
   const source = String(event.source ?? "").toLowerCase();
-  return !source.startsWith("agent:") && !source.startsWith("system:");
+  return !source.startsWith("system:") && source !== `agent:${agent.name}`.toLowerCase();
+}
+
+function isOwnMessageEvent(agent: Agent, event: Event): boolean {
+  return event.type === "message.created" && event.source === `agent:${agent.name}`;
+}
+
+function ownMessageContent(agent: Agent, event: Event): string {
+  const text = (event.payload as { text?: unknown } | undefined)?.text;
+  if (resolveReplyContract(agent.modelId, agent.modelCapabilities) === "plain-text" && typeof text === "string") {
+    return text;
+  }
+  return JSON.stringify(buildPromptEventRecord(event), null, 2);
 }
 
 function extractImageAttachments(event: Event): EventAttachment[] {
@@ -203,19 +216,8 @@ export async function toHistoryMessage(
     attachmentCache?: Map<string, Promise<AttachmentImageData | null>>;
   },
 ): Promise<LlmMessage> {
-  const agentMessage =
-    event.type === "message.created" && String(event.source ?? "").startsWith("agent:");
-  if (agentMessage && resolveReplyContract(agent.modelId, agent.modelCapabilities) === "plain-text") {
-    // Plain-text models treat system items as instructions and echo them, so replies need
-    // conversational roles: their own as assistant turns, other agents as attributed user turns.
-    if (event.source === `agent:${agent.name}`) {
-      const text = (event.payload as { text?: unknown } | undefined)?.text;
-      if (typeof text === "string" && text.trim()) return { role: "assistant", content: text };
-    } else {
-      return { role: "user", content: JSON.stringify(buildPromptEventRecord(event), null, 2) };
-    }
-  }
-  const role = isUserMessageEvent(event) ? ("user" as const) : ("system" as const);
+  if (isOwnMessageEvent(agent, event)) return { role: "assistant", content: ownMessageContent(agent, event) };
+  const role = isUserMessageEvent(agent, event) ? ("user" as const) : ("system" as const);
   if (role !== "user" || !options?.apiFetch) {
     return { role, content: JSON.stringify(buildPromptEventRecord(event), null, 2) };
   }

@@ -125,19 +125,47 @@ describe("agent runner", () => {
         source: "agent:other",
         channelId: "chan-1",
       },
+      {
+        id: "evt-4",
+        type: "message.created",
+        payload: { text: "done" },
+        source: "agent:tester",
+        channelId: "chan-1",
+      },
     ];
 
     const messages = await buildModelMessages(agent, "system prompt", events);
-    expect(messages).toHaveLength(4);
+    expect(messages).toHaveLength(5);
     expect(messages[0]).toEqual({ role: "system", content: "system prompt" });
-    expect(messages[1]?.role).toBe("user");
-    expect(messages[2]?.role).toBe("system");
-    expect(messages[3]?.role).toBe("system");
+    expect(messages.slice(1).map((message) => message.role)).toEqual([
+      "user",
+      "system",
+      "user",
+      "assistant",
+    ]);
 
     const eventIds = messages
       .slice(1)
       .map((message) => JSON.parse(message.content as string).eventId);
-    expect(eventIds).toEqual(["evt-1", "evt-2", "evt-3"]);
+    expect(eventIds).toEqual(["evt-1", "evt-2", "evt-3", "evt-4"]);
+  });
+
+  it("shows plain-text agents their own replies as plain assistant text", async () => {
+    const agent: Agent = {
+      name: "voice-agent",
+      workspacePath: "/tmp",
+      modelId: "openai:gpt-realtime",
+      desiredState: "RUNNING",
+      runtimeState: "RUNNING",
+    };
+    const events: Event[] = [
+      { id: "e1", type: "message.created", source: "agent:voice-agent", channelId: "c", payload: { text: "Hello!" } },
+      { id: "e2", type: "message.created", source: "agent:voice-agent-2", channelId: "c", payload: { text: "Hi" } },
+    ];
+    const messages = await buildModelMessages(agent, "system prompt", events);
+    expect(messages[1]).toEqual({ role: "assistant", content: "Hello!" });
+    expect(messages[2]?.role).toBe("user");
+    expect(JSON.parse(String(messages[2]?.content)).source).toBe("agent:voice-agent-2");
   });
 
   it("includes image attachment parts when message payload references files", async () => {
@@ -295,25 +323,6 @@ describe("agent runner", () => {
     expect(eventIds[eventIds.length - 1]).toBe("evt-130");
     expect(truncationMeta.omittedBefore).toBe(11);
     expect(truncationMeta.howToReadOmitted).toContain('channelId: "chan-1", before: 11');
-  });
-
-  it("gives plain-text agents conversational roles for agent messages", async () => {
-    const agent: Agent = {
-      name: "voice-agent",
-      workspacePath: "/tmp",
-      modelId: "openai:gpt-realtime",
-      desiredState: "RUNNING",
-      runtimeState: "RUNNING",
-    };
-    const events: Event[] = [
-      { id: "e1", type: "message.created", source: "human:admin", channelId: "c", payload: { text: "hi" }, createdAt: 1 },
-      { id: "e2", type: "message.created", source: "agent:voice-agent", channelId: "c", payload: { text: "Hello!" }, createdAt: 2 },
-      { id: "e3", type: "message.created", source: "agent:voice-agent-2", channelId: "c", payload: { text: "Me too" }, createdAt: 3 },
-    ];
-    const messages = await buildModelMessages(agent, "system prompt", events);
-    expect(messages.slice(1).map((message) => message.role)).toEqual(["user", "assistant", "user"]);
-    expect(messages[2]?.content).toBe("Hello!");
-    expect(JSON.parse(String(messages[3]?.content)).source).toBe("agent:voice-agent-2");
   });
 
   it("sizes the history budget from the model context window", () => {

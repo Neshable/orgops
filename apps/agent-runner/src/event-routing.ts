@@ -1,28 +1,4 @@
-import { resolveReplyContract } from "@orgops/schemas";
 import type { Agent, Event } from "./types";
-
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function mentionsAgent(payload: unknown, agentName: string): boolean {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
-  const text = (payload as { text?: unknown }).text;
-  if (typeof text !== "string" || !text) return false;
-  return new RegExp(`(^|[^\\w@])@${escapeRegExp(agentName)}(?![\\w-])`, "i").test(text);
-}
-
-function explicitlyAddressesAgent(payload: unknown, agentName: string): boolean {
-  if (getPayloadTargetAgentName(payload) === agentName) return true;
-  const names =
-    payload && typeof payload === "object" && !Array.isArray(payload)
-      ? (payload as { targetAgentNames?: unknown }).targetAgentNames
-      : undefined;
-  if (Array.isArray(names) && names.some((name) => typeof name === "string" && name.trim() === agentName)) {
-    return true;
-  }
-  return mentionsAgent(payload, agentName);
-}
 
 function getPayloadTargetAgentName(payload: unknown): string {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "";
@@ -76,15 +52,5 @@ export function shouldHandleEventForAgent(agent: Agent, event: Event): boolean {
   if (event.type?.startsWith("tool.")) return false;
   if (event.source === `agent:${agent.name}`) return false;
   if (!event.channelId) return false;
-  // Plain-text agents always answer (they cannot reliably stay silent), so two of them
-  // in one channel would ping-pong forever. They only react to agents that address them.
-  if (
-    event.type === "message.created" &&
-    String(event.source ?? "").startsWith("agent:") &&
-    resolveReplyContract(agent.modelId, agent.modelCapabilities) === "plain-text" &&
-    !explicitlyAddressesAgent(event.payload, agent.name)
-  ) {
-    return false;
-  }
   return true;
 }
