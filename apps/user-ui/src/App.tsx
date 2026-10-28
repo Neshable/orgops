@@ -894,6 +894,8 @@ export default function App() {
   const voiceLevelRef = useRef<HTMLSpanElement | null>(null);
   const voiceElapsedRef = useRef<HTMLSpanElement | null>(null);
   const resolvedVoiceChunkIdsRef = useRef<Set<string>>(new Set());
+  const messagesPinnedToBottomRef = useRef(true);
+  const messagesAutoScrollUntilRef = useRef(0);
   const voicePlaybackQueueRef = useRef<string[]>([]);
   const voicePlaybackActiveRef = useRef<HTMLAudioElement | null>(null);
   const liveVoiceStreamRef = useRef<MediaStream | null>(null);
@@ -1427,6 +1429,8 @@ export default function App() {
   }
 
   function scrollMessagesToBottom(behavior: ScrollBehavior = "smooth") {
+    messagesPinnedToBottomRef.current = true;
+    messagesAutoScrollUntilRef.current = performance.now() + 800;
     window.requestAnimationFrame(() => {
       const panel = messagesPanelRef.current;
       if (!panel) return;
@@ -1434,10 +1438,15 @@ export default function App() {
     });
   }
 
-  function isMessagesPanelNearBottom() {
+  function isMessagesPanelScrolledToBottom() {
     const panel = messagesPanelRef.current;
     if (!panel) return true;
     return panel.scrollHeight - panel.scrollTop - panel.clientHeight < 80;
+  }
+
+  /** Whether new messages should keep the panel at the bottom; only the user's own scrolling unpins it. */
+  function isMessagesPanelNearBottom() {
+    return messagesPinnedToBottomRef.current || isMessagesPanelScrolledToBottom();
   }
 
   function newestMessageTime(channelEvents: EventRow[]) {
@@ -2693,7 +2702,12 @@ export default function App() {
   }
 
   function handleMessagesScroll() {
-    if (hasNewMessagesBelow && isMessagesPanelNearBottom()) {
+    const atBottom = isMessagesPanelScrolledToBottom();
+    // Smooth auto-scrolls pass through intermediate positions; those are not the user scrolling away.
+    if (performance.now() >= messagesAutoScrollUntilRef.current) {
+      messagesPinnedToBottomRef.current = atBottom;
+    }
+    if (hasNewMessagesBelow && atBottom) {
       setHasNewMessagesBelow(false);
     }
   }
@@ -3305,6 +3319,17 @@ export default function App() {
     window.addEventListener("resize", handleWindowResize);
     return () => window.removeEventListener("resize", handleWindowResize);
   }, []);
+
+  // The call bar and composer resizing shrink the panel without scrolling it; stay pinned to the newest message.
+  useEffect(() => {
+    const panel = messagesPanelRef.current;
+    if (!panel || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (messagesPinnedToBottomRef.current) panel.scrollTop = panel.scrollHeight;
+    });
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [authenticated, activeChannelId]);
 
   if (authLoading && !authenticated) {
     return <main className="loading-screen">Loading OrgOps...</main>;
