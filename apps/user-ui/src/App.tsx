@@ -3677,6 +3677,7 @@ export default function App() {
                     voiceMeta?.durationMs ?? audioAttachments[0]?.durationMs
                   );
                   const text = messageText(event);
+                  const postingAgentName = event.source.startsWith("agent:") ? sourceLabel(event.source) : "";
                   const markdown = shouldRenderMarkdown(text);
                   const sensitive = sensitiveMessagePayload(event);
                   const revealedSensitive = revealedSensitiveByEvent[event.id] ?? "";
@@ -3718,6 +3719,7 @@ export default function App() {
                           {splitJsonRenderMarkdown(text).map((jsonPart, jsonIndex) =>
                             jsonPart.kind === "json-render" ? (
                               <JsonRenderBlock
+                                agentName={postingAgentName}
                                 canPost={activeChannelCanPost && !activeChannel?.archivedAt}
                                 channelId={activeChannelId}
                                 key={`${event.id}-json-render-${jsonIndex}`}
@@ -3728,6 +3730,7 @@ export default function App() {
                               splitSecretInputMarkdown(jsonPart.text).map((secretPart, secretIndex) =>
                                 secretPart.kind === "secret-input" ? (
                                   <OrgopsSecretInput
+                                    agentName={postingAgentName}
                                     key={`${event.id}-secret-input-${jsonIndex}-${secretIndex}`}
                                     spec={secretPart.spec}
                                   />
@@ -3765,6 +3768,7 @@ export default function App() {
                                   {splitJsonRenderMarkdown(revealedSensitive).map((jsonPart, jsonIndex) =>
                                     jsonPart.kind === "json-render" ? (
                                       <JsonRenderBlock
+                                        agentName={postingAgentName}
                                         canPost={activeChannelCanPost && !activeChannel?.archivedAt}
                                         channelId={activeChannelId}
                                         key={`${event.id}-sensitive-json-render-${jsonIndex}`}
@@ -3775,6 +3779,7 @@ export default function App() {
                                       splitSecretInputMarkdown(jsonPart.text).map((secretPart, secretIndex) =>
                                         secretPart.kind === "secret-input" ? (
                                           <OrgopsSecretInput
+                                            agentName={postingAgentName}
                                             key={`${event.id}-sensitive-secret-input-${jsonIndex}-${secretIndex}`}
                                             spec={secretPart.spec}
                                           />

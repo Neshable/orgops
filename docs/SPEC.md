@@ -143,7 +143,7 @@ Commands run with the agent workspace/source directory as cwd unless overridden 
 - `ORGOPS_WRAPPED_TRIGGER_EVENT_ID` (turn commands)
 - `ORGOPS_WRAPPED_SOURCE_DIR` (when a source checkout is configured)
 
-Resolved runtime secrets are injected into setup and turn command environments using precedence `private > team > public > package(legacy)`.
+Resolved runtime secrets are injected into setup and turn command environments using precedence `private > human > team > public > package`. Existing `package` rows still load. New `package` writes are rejected.
 
 Wrapper harness implementation:
 
@@ -522,7 +522,7 @@ Presence events (bookkeeping only):
   - `start`, `stop`, `restart`, `reload-skills`, `cleanup-workspace`
 - agent management utilities:
   - `GET /api/agents/:name/transfer` exports an agent bundle: configuration, workspace files, enabled skill files, private secrets, and memory
-  - `POST /api/agents/:name/copy` clones the agent. Enabled and always-preloaded skills are copied. Workspace files are copied. Private secrets are copied only when the destination does not already have the same name as a public or package secret. Skill directories are written under the new workspace only when that skill name is not already in the repo skill catalog. Channel and cross-channel memory summaries are copied. Channel memory is attached to the same channel id, or to a destination channel with the same name. Processes are not copied.  Optional `federationInstanceId` copies the bundle onto that peer instead of creating a local agent
+  - `POST /api/agents/:name/copy` clones the agent. Enabled and always-preloaded skills are copied. Workspace files are copied. Private secrets are copied only when the destination does not already have the same name as a public secret. Skill directories are written under the new workspace only when that skill name is not already in the repo skill catalog. Channel and cross-channel memory summaries are copied. Channel memory is attached to the same channel id, or to a destination channel with the same name. Processes are not copied.  Optional `federationInstanceId` copies the bundle onto that peer instead of creating a local agent
   - `POST /api/agents/:name/move` reassigns `assignedRunnerId` on this instance, keeps the workspace path, and stops running or starting processes. Optional `federationInstanceId` sends the same bundle, including memory, to that peer, stops local processes, and then deletes the local agent. `name` sets the destination agent name
   - peers accept `GET|POST /api/federation/agents/transfer` with the peer bearer token
   - humans call these routes from the admin UI; agents call `agents_copy` and `agents_move`
@@ -615,13 +615,13 @@ Presence events (bookkeeping only):
 
 - secrets:
   - `GET /api/secrets`
-  - `GET /api/secrets/keys`
   - `POST /api/secrets`
   - `DELETE /api/secrets/:id`
   - `DELETE /api/secrets` (by key/scope tuple)
   - `GET /api/secrets/env` (runner auth only)
-  - scope types: `public`, `team`, `private`, `human` (`package` remains supported as legacy compatibility scope)
-  - env resolution precedence: `private > human > team > public > package(legacy)`
+  - scope types: `public`, `team`, `private`, `human`. `package` is no longer accepted for writes. Existing package rows remain listable, deletable, and injected.
+  - chat secret forms (`<orgops-secret-input>` and json-render `SecretInput`) store a `private` secret for the agent that posted the form
+  - env resolution precedence: `private > human > team > public > package`
 - skills:
   - `GET /api/skills`
   - the API resolves the skill root from `ORGOPS_PROJECT_ROOT` when set, otherwise from the API module location; `createApp({ projectRoot })` provides an explicit embedding/test override
@@ -736,6 +736,7 @@ Current tool families exposed to models:
 - `shell_run` (timeout enforced; default 45s; accepts `timeoutMs`; force-kills on timeout)
 - `fs_read`, `fs_write`, `fs_list`, `fs_stat`, `fs_mkdir`, `fs_rm`, `fs_move`
 - `shell_start`, `shell_stop`, `shell_status`, `shell_tail`
+  - shell commands receive `ORGOPS_AGENT_NAME` plus the agent's resolved secrets as env
 - event/navigation helpers:
   - `events_emit`
   - `events_channel_messages`, `events_search`

@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { decryptSecret, parseMasterKey } from "@orgops/crypto";
+import { decryptSecret, encryptSecret, parseMasterKey } from "@orgops/crypto";
 import { createDrizzleDb, migrate, openDb, schema } from "@orgops/db";
 import { createApp } from "./app";
 
@@ -8066,7 +8066,7 @@ describe("api app", () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it("resolves secret env precedence as private > team > public > package", async () => {
+  it("resolves secret env precedence as private > team > public", async () => {
     const previousMasterKey = process.env.ORGOPS_MASTER_KEY;
     process.env.ORGOPS_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
     const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
@@ -8141,7 +8141,6 @@ describe("api app", () => {
     }
 
     const createSecrets = [
-      { name: "OPENAI_API_KEY", scopeType: "package", scopeId: "llm", value: "pkg-key" },
       { name: "OPENAI_API_KEY", scopeType: "public", scopeId: null, value: "public-key" },
       { name: "OPENAI_API_KEY", scopeType: "private", scopeId: "agent-a", value: "private-key-a" },
       { name: "ANTHROPIC_API_KEY", scopeType: "public", scopeId: null, value: "anth-public" },
@@ -8249,6 +8248,108 @@ describe("api app", () => {
     expect(envRes.status).toBe(200);
     const env = (await envRes.json()) as Record<string, string>;
     expect(env.CURSOR_API_KEY).toBe("cursor-token");
+
+    if (previousMasterKey === undefined) delete process.env.ORGOPS_MASTER_KEY;
+    else process.env.ORGOPS_MASTER_KEY = previousMasterKey;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("rejects package scope writes and still injects stored package secrets", async () => {
+    const previousMasterKey = process.env.ORGOPS_MASTER_KEY;
+    process.env.ORGOPS_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+    const db = openDb(":memory:");
+    const { app } = createApp({
+      db,
+      dataDir,
+      adminUser: "admin",
+      adminPass: "admin",
+      runnerToken: "test-token",
+    });
+
+    const loginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "admin" }),
+    });
+    expect(loginRes.status).toBe(200);
+    const cookie = loginRes.headers.get("set-cookie") ?? "";
+
+    const createAgentRes = await app.request("http://localhost/api/agents", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        name: "ATLE dev",
+        modelId: "openai:gpt-4o-mini",
+        workspacePath: ".orgops-data/workspaces/atle-dev",
+      }),
+    });
+    expect(createAgentRes.status).toBe(201);
+
+    const rejected = await app.request("http://localhost/api/secrets", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({ package: "llm", key: "OPENAI_API_KEY", value: "first-key" }),
+    });
+    expect(rejected.status).toBe(400);
+
+    const orm = createDrizzleDb(db);
+    const masterKey = parseMasterKey(process.env.ORGOPS_MASTER_KEY ?? "");
+    orm
+      .insert(schema.secrets)
+      .values({
+        id: randomUUID(),
+        name: "OPENAI_API_KEY",
+        scope_type: "package",
+        scope_id: "llm",
+        ciphertext_b64: encryptSecret(masterKey, "stale-package-key"),
+        created_at: Date.now(),
+      })
+      .run();
+
+    const privateSecret = await app.request("http://localhost/api/secrets", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        key: "ATLE_OPENAI_API_KEY",
+        value: "agent-key",
+        scopeType: "private",
+        scopeId: "ATLE dev",
+      }),
+    });
+    expect(privateSecret.status).toBe(201);
+
+    const envRes = await app.request("http://localhost/api/secrets/env", {
+      headers: {
+        "x-orgops-runner-token": "test-token",
+        "x-orgops-agent-name": "ATLE dev",
+      },
+    });
+    expect(envRes.status).toBe(200);
+    const env = (await envRes.json()) as Record<string, string>;
+    expect(env.OPENAI_API_KEY).toBe("stale-package-key");
+    expect(env.ATLE_OPENAI_API_KEY).toBe("agent-key");
+
+    const override = await app.request("http://localhost/api/secrets", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        key: "OPENAI_API_KEY",
+        value: "public-key",
+        scopeType: "public",
+      }),
+    });
+    expect(override.status).toBe(201);
+
+    const overriddenRes = await app.request("http://localhost/api/secrets/env", {
+      headers: {
+        "x-orgops-runner-token": "test-token",
+        "x-orgops-agent-name": "ATLE dev",
+      },
+    });
+    expect(overriddenRes.status).toBe(200);
+    const overridden = (await overriddenRes.json()) as Record<string, string>;
+    expect(overridden.OPENAI_API_KEY).toBe("public-key");
 
     if (previousMasterKey === undefined) delete process.env.ORGOPS_MASTER_KEY;
     else process.env.ORGOPS_MASTER_KEY = previousMasterKey;

@@ -160,6 +160,7 @@ async function spawnTrackedProcess(
   const shell = getShellLaunch(input.cmd);
   const mergedEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
+    ORGOPS_AGENT_NAME: ctx.agent.name,
     ...ctx.injectionEnv,
     ...input.env,
   };

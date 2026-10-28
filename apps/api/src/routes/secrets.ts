@@ -30,7 +30,7 @@ const KNOWN_SCOPE_TYPES = new Set([
   SCOPE_PACKAGE,
   LEGACY_SCOPE_APP,
 ]);
-const SAFE_SCOPE_ID_PATTERN = /^[a-zA-Z0-9._-]+$/;
+const SAFE_SCOPE_ID_PATTERN = /^[a-zA-Z0-9._ -]+$/;
 const ENV_SCOPE_TYPES = [
   SCOPE_PUBLIC,
   SCOPE_TEAM,
@@ -310,14 +310,20 @@ export function registerSecretsRoutes(app: Hono<any>, deps: SecretsDeps) {
     const packageId = parseScopeId(body.package);
     const scopeTypeProvided = body.scopeType !== undefined && body.scopeType !== null;
     const explicitScopeType = normalizeScopeType(body.scopeType);
+    if (packageId || explicitScopeType === SCOPE_PACKAGE) {
+      return {
+        ok: false as const,
+        error: "Package scope is no longer supported. Store the secret as private for an agent.",
+      };
+    }
     if (scopeTypeProvided && !explicitScopeType) {
       return {
         ok: false as const,
-        error: "Invalid scopeType. Use public, team, private, human, or package.",
+        error: "Invalid scopeType. Use public, team, private, or human.",
       };
     }
-    const scopeType = explicitScopeType ?? (packageId ? SCOPE_PACKAGE : SCOPE_PUBLIC);
-    const rawScopeId = parseScopeId(body.scopeId) ?? packageId;
+    const scopeType = explicitScopeType ?? SCOPE_PUBLIC;
+    const rawScopeId = parseScopeId(body.scopeId);
     let scopeId: string | null = rawScopeId;
     if (scopeType === SCOPE_PUBLIC) {
       scopeId = null;
@@ -326,7 +332,7 @@ export function registerSecretsRoutes(app: Hono<any>, deps: SecretsDeps) {
     } else if (!scopeId) {
       return {
         ok: false as const,
-        error: "scopeId is required for private, team, human, and package secrets",
+        error: "scopeId is required for private, team, and human secrets",
       };
     } else if (!SAFE_SCOPE_ID_PATTERN.test(scopeId)) {
       return { ok: false as const, error: "scopeId contains invalid characters" };
@@ -357,34 +363,6 @@ export function registerSecretsRoutes(app: Hono<any>, deps: SecretsDeps) {
       .all()
       .filter((row) => canReadSecretScope(user, row.scope_type, row.scope_id ?? null));
     return jsonResponse(c, rows);
-  });
-
-  app.get("/api/secrets/keys", requireAuth, (c) => {
-    const packageFilter = new URL(c.req.url).searchParams.get("package");
-    const user = (c as any).get("user") as RequestUser | undefined;
-    let rows: { name: string; scope_id: string | null }[];
-    if (packageFilter) {
-      rows = orm
-        .select({ name: schema.secrets.name, scope_id: schema.secrets.scope_id })
-        .from(schema.secrets)
-        .where(
-          and(
-            eq(schema.secrets.scope_type, SCOPE_PACKAGE),
-            eq(schema.secrets.scope_id, packageFilter),
-          ),
-        )
-        .all() as any[];
-    } else {
-      rows = orm
-        .select({ name: schema.secrets.name, scope_id: schema.secrets.scope_id })
-        .from(schema.secrets)
-        .where(eq(schema.secrets.scope_type, SCOPE_PACKAGE))
-        .all() as any[];
-    }
-    const keys = rows
-      .filter((row) => canReadSecretScope(user, SCOPE_PACKAGE, row.scope_id ?? null))
-      .map((row) => ({ package: row.scope_id ?? "", key: row.name }));
-    return jsonResponse(c, { keys });
   });
 
   app.post("/api/secrets", requireAuth, async (c) => {

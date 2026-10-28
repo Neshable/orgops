@@ -39,7 +39,7 @@ export type GenerateOptions = {
   maxSteps?: number;
   tools?: Record<string, LlmTool>;
   abortSignal?: AbortSignal;
-  /** Env vars for API keys etc.; overrides process.env when set. Used by runner to inject package secrets. */
+  /** Env vars for API keys etc.; overrides process.env when set. Used by the runner to inject scoped secrets. */
   env?: Record<string, string | undefined>;
   /** Optional hook called between model steps to append fresh messages. */
   pullMessages?: () => Promise<LlmMessage[] | undefined>;
