@@ -894,6 +894,8 @@ export default function App() {
   const voiceLevelRef = useRef<HTMLSpanElement | null>(null);
   const voiceElapsedRef = useRef<HTMLSpanElement | null>(null);
   const resolvedVoiceChunkIdsRef = useRef<Set<string>>(new Set());
+  const voicePlaybackQueueRef = useRef<string[]>([]);
+  const voicePlaybackActiveRef = useRef<HTMLAudioElement | null>(null);
   const liveVoiceStreamRef = useRef<MediaStream | null>(null);
   const liveVoicePeerRef = useRef<RTCPeerConnection | null>(null);
   const liveVoiceAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -1706,6 +1708,61 @@ export default function App() {
     }
   }
 
+  /** Live agent voice messages play one after another; history never autoplays. */
+  function enqueueAgentVoicePlayback(event: EventRow) {
+    if (!String(event.source ?? "").startsWith("agent:")) return;
+    if (messageVoiceMeta(event.payload)?.mode === "realtime") return;
+    const audioCount = parseMessageAttachments(event.payload).filter((attachment) =>
+      attachment.mime?.startsWith("audio/")
+    ).length;
+    for (let index = 0; index < audioCount; index += 1) {
+      voicePlaybackQueueRef.current.push(`${event.id}:${index}`);
+    }
+    if (audioCount > 0) playNextAgentVoice();
+  }
+
+  function playNextAgentVoice(lookupAttempt = 0) {
+    if (voicePlaybackActiveRef.current) return;
+    if (liveVoiceCallRef.current) {
+      voicePlaybackQueueRef.current = [];
+      return;
+    }
+    if (voiceRecorderRef.current) {
+      window.setTimeout(() => playNextAgentVoice(), 500);
+      return;
+    }
+    const key = voicePlaybackQueueRef.current[0];
+    if (!key) return;
+    const audio = document.querySelector<HTMLAudioElement>(`audio[data-voice-key="${CSS.escape(key)}"]`);
+    if (!audio) {
+      if (lookupAttempt < 20) {
+        window.setTimeout(() => playNextAgentVoice(lookupAttempt + 1), 100);
+      } else {
+        voicePlaybackQueueRef.current.shift();
+        playNextAgentVoice();
+      }
+      return;
+    }
+    voicePlaybackQueueRef.current.shift();
+    voicePlaybackActiveRef.current = audio;
+    const finish = (continueQueue: boolean) => {
+      audio.removeEventListener("ended", onEnded);
+      audio.removeEventListener("pause", onPause);
+      voicePlaybackActiveRef.current = null;
+      if (continueQueue) playNextAgentVoice();
+      else voicePlaybackQueueRef.current = [];
+    };
+    const onEnded = () => finish(true);
+    // Pausing (by the user, or by the player leaving the page) stops the whole queue.
+    const onPause = () => {
+      if (!audio.ended) finish(false);
+    };
+    audio.addEventListener("ended", onEnded);
+    audio.addEventListener("pause", onPause);
+    audio.currentTime = 0;
+    audio.play().catch(() => finish(false));
+  }
+
   function handleIncomingRealtimeEvent(event: EventRow) {
     if (!event.id || !rememberWsEvent(event.id)) return;
     const eventChannelId = event.channelId;
@@ -1745,6 +1802,7 @@ export default function App() {
       const shouldAutoScroll = isMessagesPanelNearBottom();
       if (!hiddenUiAction) {
         setEvents((current) => mergeEventsChronologically(current, [event]));
+        if (event.type === "message.created") enqueueAgentVoicePlayback(event);
       }
       if (event.type === "message.created" || event.type === "agent.turn.failed") {
         const eventCreatedAt = event.createdAt ?? 0;
@@ -2911,6 +2969,7 @@ export default function App() {
 
   async function startLiveVoice() {
     if (liveVoiceSessionIdRef.current || liveVoiceStarting || !canStartLiveVoice) return;
+    voicePlaybackActiveRef.current?.pause();
     const channelId = activeChannelIdRef.current || activeChannelId;
     const agentName = liveVoiceCallTarget;
     if (!channelId || !agentName) return;
@@ -3064,6 +3123,7 @@ export default function App() {
 
   async function startVoiceRecording() {
     if (recordingVoice || !canSendVoiceMessage || liveVoiceSessionIdRef.current) return;
+    voicePlaybackActiveRef.current?.pause();
     const channelId = activeChannelIdRef.current || activeChannelId;
     if (!channelId) return;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
@@ -3704,6 +3764,7 @@ export default function App() {
                           {audioAttachments.map((attachment, index) => (
                             <audio
                               key={`${event.id}-audio-${index}`}
+                              data-voice-key={`${event.id}:${index}`}
                               controls
                               preload="metadata"
                               src={`/api/files/${encodeURIComponent(attachment.fileId)}`}

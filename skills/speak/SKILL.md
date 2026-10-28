@@ -18,7 +18,7 @@ Agents on a realtime voice call already speak natively; this skill is for text a
 ## Secrets / auth
 
 - Requires `OPENAI_API_KEY` in OrgOps secrets (the same key OpenAI models use); the runner injects it into shell tools.
-- Optional env: `ORGOPS_TTS_MODEL` (default `gpt-4o-mini-tts`), `ORGOPS_TTS_VOICE` (default `marin`).
+- Optional env: `ORGOPS_TTS_MODEL` (default `gpt-4o-mini-tts`), `ORGOPS_TTS_VOICE` (default: a fixed voice picked from your agent name, so each agent sounds distinct).
 
 ## How to reply with voice
 
@@ -49,7 +49,7 @@ Agents on a realtime voice call already speak natively; this skill is for text a
 
 ## Options
 
-- `--voice <name>`: `marin`, `cedar`, `alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer`, `verse`.
+- `--voice <name>`: `marin`, `cedar`, `alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer`, `verse`. Omit it to keep your own consistent voice.
 - `--instructions "<tone>"`: delivery guidance, e.g. `"Calm and friendly, moderate pace."`
 - `--format mp3|wav|opus|aac|flac` (default `mp3`).
 - `--model <id>` and `--out <path>` to override the model or output file.

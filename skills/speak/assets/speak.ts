@@ -3,6 +3,15 @@ import { dirname, resolve } from "node:path";
 
 const MAX_INPUT_CHARS = 4096;
 const FORMATS = new Set(["mp3", "wav", "opus", "aac", "flac"]);
+const VOICES = ["marin", "cedar", "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"];
+
+/** A stable voice per agent, so several agents speaking in one channel sound distinct. */
+function voiceForAgent(agentName: string | undefined): string {
+  if (!agentName) return "marin";
+  let hash = 0;
+  for (const char of agentName) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return VOICES[hash % VOICES.length]!;
+}
 
 function parseArgs(argv: string[]) {
   const out: Record<string, string | undefined> = {};
@@ -29,7 +38,7 @@ async function main() {
   const format = args.format ?? "mp3";
   if (!FORMATS.has(format)) throw new Error(`--format must be one of ${[...FORMATS].join(", ")}`);
   const model = args.model ?? process.env.ORGOPS_TTS_MODEL ?? "gpt-4o-mini-tts";
-  const voice = args.voice ?? process.env.ORGOPS_TTS_VOICE ?? "marin";
+  const voice = args.voice ?? process.env.ORGOPS_TTS_VOICE ?? voiceForAgent(process.env.ORGOPS_AGENT_NAME);
   const out = resolve(args.out ?? `.orgops-speech/speech-${Date.now()}.${format}`);
 
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
