@@ -271,6 +271,12 @@ function formatValidationErrors(validation: EventValidationResult): string {
     .join("\n");
 }
 
+function generateUsedTools(result: GenerateResult): boolean {
+  if ((result.toolCalls?.length ?? 0) > 0) return true;
+  if ((result.toolResults?.length ?? 0) > 0) return true;
+  return result.finishReason === "tool-calls";
+}
+
 function buildFallbackMessageEvent(
   agentName: string,
   channelId: string,
@@ -912,6 +918,24 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         maxAttempts: MAX_EVENT_DISPATCH_ATTEMPTS,
       });
       if (hasLateInjectedEvents) continue;
+      if (!responseText.trim()) {
+        if (postedMessageToChannel) {
+          await emitTurnEvent("agent.turn.completed", {});
+          return;
+        }
+        if (plainTextReplies || generateUsedTools(result)) {
+          await emitTurnEvent("agent.turn.completed", { noReply: true });
+          return;
+        }
+        retryMessages.push({
+          role: "system",
+          content: [
+            `Your previous response was empty on attempt ${attempt}/${MAX_EVENT_DISPATCH_ATTEMPTS}.`,
+            "Return only a JSON event object.",
+          ].join("\n"),
+        });
+        continue;
+      }
       if (plainTextReplies) {
         const reply = responseText.trim();
         const calledNoop = (result.toolCalls ?? []).some(
@@ -1005,6 +1029,10 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       }
       await input.api.emitEvent(eventDraft);
       await emitTurnEvent("agent.turn.completed", {});
+      return;
+    }
+    if (!lastResponseText.trim() || postedMessageToChannel) {
+      await emitTurnEvent("agent.turn.completed", postedMessageToChannel ? {} : { noReply: true });
       return;
     }
     await input.api.emitEvent(

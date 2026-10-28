@@ -246,7 +246,7 @@ already answered them.
 - secret text may be sent as `payload.sensitive.plaintext` (or pre-encrypted `ciphertextB64`)
 - API encrypts plaintext into `payload.sensitive.ciphertextB64` using `ORGOPS_MASTER_KEY` before persistence
 - reveal requires `POST /api/events/:id/reveal-sensitive` with the caller's current password
-- runner guidance tells agents to use `payload.sensitive.plaintext` for one-time tokens; persisted `tool.executed` output for token-creating tools is redacted before insertion into the append-only event log
+- runner guidance tells agents to use `payload.sensitive.plaintext` for one-time tokens; persisted `tool.executed` output for token-creating tools is redacted before insertion into the append-only event log, and all persisted tool output is capped so recursive `events_search` / `tool.executed` payloads cannot grow without bound. Event listings skip JSON-parsing oversized `payload_json` blobs and return a truncated stub instead. `events_search` defaults to 50 compacted events and excludes bookkeeping types (`tool.`, `telemetry.`, `audit.`, `process.`, `wrapper.`, `agent.turn.`, `agent.control.`, `voice.`) unless the caller asks for that family.
 
 Validation is dynamic and composed from:
 
@@ -707,7 +707,7 @@ Runner loop:
 6. Filter control/audit/self-authored/agent-authored events.
 7. Group remaining pending events by channel and process each channel as a single handling batch.
 8. Execute by agent mode:
-   - `CLASSIC`: call LLM, enforce JSON event output with retries, validate and emit. Models whose `replyContract` capability is `plain-text` instead have their final text posted as the reply (see Models and Realtime Voice).
+   - `CLASSIC`: call LLM, enforce JSON event output with retries, validate and emit. Empty final text after tool calls (or a current-channel `events_emit` reply) completes the turn without posting `Unable to produce structured event output.`. Models whose `replyContract` capability is `plain-text` instead have their final text posted as the reply (see Models and Realtime Voice).
    - `RLM_REPL`: run recursive REPL loop in child process with explicit `done(result)`.
    - `WRAPPED`: skip orgops memory/prompt/skills/model calls and run the configured external runtime recipe.
 9. For native modes, build context from runner guidance + bounded channel history + skills + `soul_contents`, plus a synthetic merged-trigger message when a batch contains multiple events. Human message attachments (except voice-note audio) are downloaded once into `<workspace>/.orgops-attachments/<fileId>/<name>` and exposed as `payload.attachments[].localPath`; image attachments are also inlined as image parts.

@@ -395,6 +395,7 @@ const coreEventShapes: EventShapeDefinition[] = [
           triggerEventId: z.string().min(1),
           eventCount: z.number().int().positive().optional(),
           completedWithFallback: z.boolean().optional(),
+          noReply: z.boolean().optional(),
         })
         .passthrough(),
     }),

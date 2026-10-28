@@ -298,6 +298,27 @@ export function createApp(config: AppConfig = {}) {
     }
   }
 
+  const MAX_EVENT_PAYLOAD_JSON_CHARS = 262_144;
+
+  function parseEventPayload(payloadJson: unknown): {
+    payload: unknown;
+    payloadTruncated: boolean;
+  } {
+    if (typeof payloadJson !== "string") {
+      return { payload: {}, payloadTruncated: false };
+    }
+    if (payloadJson.length > MAX_EVENT_PAYLOAD_JSON_CHARS) {
+      return {
+        payload: {
+          truncated: true,
+          omittedChars: payloadJson.length - MAX_EVENT_PAYLOAD_JSON_CHARS,
+        },
+        payloadTruncated: true,
+      };
+    }
+    return { payload: parseJson(payloadJson, {}), payloadTruncated: false };
+  }
+
   function parseStringArraySafe(input: string | null | undefined): string[] {
     if (!input) return [];
     try {
@@ -317,10 +338,11 @@ export function createApp(config: AppConfig = {}) {
   }
 
   function eventRowToApi(row: any) {
+    const { payload, payloadTruncated } = parseEventPayload(row.payload_json);
     return {
       id: row.id,
       type: row.type,
-      payload: parseJson(row.payload_json, {}),
+      payload,
       source: row.source,
       channelId: row.channel_id ?? undefined,
       parentEventId: row.parent_event_id ?? undefined,
@@ -330,6 +352,7 @@ export function createApp(config: AppConfig = {}) {
       lastError: row.last_error ?? undefined,
       idempotencyKey: row.idempotency_key ?? undefined,
       createdAt: row.created_at,
+      ...(payloadTruncated ? { payloadTruncated: true } : {}),
     };
   }
 

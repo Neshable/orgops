@@ -47,6 +47,7 @@ export type CreateExecuteFn = (
 
 const REDACTED_ONE_TIME_SECRET = "[REDACTED: one-time secret]";
 const ORGOPS_INTEGRATION_TOKEN_RE = /org_sk_[A-Za-z0-9]{20,}/g;
+export const MAX_PERSISTED_TOOL_OUTPUT_CHARS = 16_000;
 
 function redactIntegrationTokenStrings(value: unknown): unknown {
   if (typeof value === "string") {
@@ -64,13 +65,37 @@ function redactIntegrationTokenStrings(value: unknown): unknown {
   );
 }
 
-export function redactPersistedToolOutput(toolName: string, output: unknown) {
-  if (toolName !== "agents_create_integration_key") {
-    return { output, redacted: false };
+function truncatePersistedToolOutput(output: unknown): { output: unknown; truncated: boolean } {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(output);
+  } catch {
+    serialized = String(output);
   }
+  if (serialized.length <= MAX_PERSISTED_TOOL_OUTPUT_CHARS) {
+    return { output, truncated: false };
+  }
+  const omitted = serialized.length - MAX_PERSISTED_TOOL_OUTPUT_CHARS;
   return {
-    output: redactIntegrationTokenStrings(output),
-    redacted: true,
+    output: {
+      truncated: true,
+      omittedChars: omitted,
+      preview: serialized.slice(0, MAX_PERSISTED_TOOL_OUTPUT_CHARS),
+    },
+    truncated: true,
+  };
+}
+
+export function redactPersistedToolOutput(toolName: string, output: unknown) {
+  const redactedOutput =
+    toolName === "agents_create_integration_key"
+      ? redactIntegrationTokenStrings(output)
+      : output;
+  const tokenRedacted = toolName === "agents_create_integration_key";
+  const sizeLimited = truncatePersistedToolOutput(redactedOutput);
+  return {
+    output: sizeLimited.output,
+    redacted: tokenRedacted || sizeLimited.truncated,
   };
 }
 

@@ -262,6 +262,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
       status: params.get("status"),
       after: params.get("after"),
       before: params.get("before"),
+      hasExplicitLimit: params.has("limit"),
       limit: Math.min(Number(params.get("limit") ?? 100), MAX_EVENT_ROWS),
       order: params.get("order"),
       descending: params.get("order") === "desc",
@@ -309,6 +310,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
       status,
       after,
       before,
+      hasExplicitLimit,
       limit,
       descending,
       all,
@@ -327,8 +329,13 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
     }
     const now = Date.now();
     // includeAll (the sqlite export) stays uncapped — it is a deliberate,
-    // rare dump; the client-facing all=1 is capped at MAX_EVENT_ROWS.
-    const rowCap = options.includeAll ? null : all ? MAX_EVENT_ROWS : limit;
+    // rare dump; the client-facing all=1 is capped at MAX_EVENT_ROWS unless
+    // the caller also passed limit, in which case limit wins.
+    const rowCap = options.includeAll
+      ? null
+      : all && !hasExplicitLimit
+        ? MAX_EVENT_ROWS
+        : limit;
 
     const whereClauses: any[] = [];
 
