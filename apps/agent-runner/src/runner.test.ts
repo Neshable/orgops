@@ -94,6 +94,36 @@ describe("agent runner", () => {
     });
   });
 
+  it("does not fail the triggering event when a tool returns an error", async () => {
+    const requests: string[] = [];
+    const tools = createRunnerTools({
+      agent: {
+        name: "tester",
+        workspacePath: "/tmp",
+        modelId: "openai:gpt-4o-mini",
+        desiredState: "RUNNING",
+        runtimeState: "RUNNING",
+      },
+      event: {
+        id: "human-msg",
+        type: "message.created",
+        payload: { text: "hello" },
+        source: "human:alice",
+      },
+      channelId: "chan-1",
+      runTool: async () => ({ error: "Invalid arguments for tool" }),
+      apiFetch: async (path: string) => {
+        requests.push(path);
+        return new Response("{}", { status: 200 });
+      },
+      emitEvent: async () => {},
+    });
+
+    const output = await tools.shell_run?.execute?.({ cmd: "true" });
+    expect(output).toEqual({ error: "Invalid arguments for tool" });
+    expect(requests.some((path) => path.endsWith("/fail"))).toBe(false);
+  });
+
   it("builds model messages from all channel events", async () => {
     const agent: Agent = {
       name: "tester",

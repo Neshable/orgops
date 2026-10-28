@@ -712,7 +712,7 @@ Runner loop:
    - `WRAPPED`: skip orgops memory/prompt/skills/model calls and run the configured external runtime recipe.
 9. For native modes, build context from runner guidance + bounded channel history + skills + `soul_contents`, plus a synthetic merged-trigger message when a batch contains multiple events. Human message attachments (except voice-note audio) are downloaded once into `<workspace>/.orgops-attachments/<fileId>/<name>` and exposed as `payload.attachments[].localPath`; image attachments are also inlined as image parts.
 10. For native modes, run model generation in step mode (single-step/attempt calls) and poll pending events for the same `(agent, channel)` between attempts; newly arrived events are merged into subsequent attempt context.
-11. On handler failure, call `/api/events/:id/fail` for each event in the failed channel batch.
+11. On handler failure, call `/api/events/:id/fail` for each event in the failed channel batch. Tool errors during a turn are returned to the model and recorded as `tool.failed` / `tool.executed`; they do not increment the triggering event's failure count.
 
 Wrapped lifecycle:
 
