@@ -736,7 +736,7 @@ Current tool families exposed to models:
 - `shell_run` (timeout enforced; default 45s; accepts `timeoutMs`; force-kills on timeout)
 - `fs_read`, `fs_write`, `fs_list`, `fs_stat`, `fs_mkdir`, `fs_rm`, `fs_move`
 - `shell_start`, `shell_stop`, `shell_status`, `shell_tail`
-  - shell commands receive `ORGOPS_AGENT_NAME` plus the agent's resolved secrets as env
+  - shell commands receive `ORGOPS_AGENT_NAME`, `ORGOPS_AGENT_WORKSPACE` (resolved workspace path), and the agent's resolved secrets as env
 - event/navigation helpers:
   - `events_emit`
   - `events_channel_messages`, `events_search`

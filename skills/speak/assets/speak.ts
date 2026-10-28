@@ -39,7 +39,8 @@ async function main() {
   if (!FORMATS.has(format)) throw new Error(`--format must be one of ${[...FORMATS].join(", ")}`);
   const model = args.model ?? process.env.ORGOPS_TTS_MODEL ?? "gpt-4o-mini-tts";
   const voice = args.voice ?? process.env.ORGOPS_TTS_VOICE ?? voiceForAgent(process.env.ORGOPS_AGENT_NAME);
-  const out = resolve(args.out ?? `.orgops-speech/speech-${Date.now()}.${format}`);
+  const outputRoot = process.env.ORGOPS_AGENT_WORKSPACE || process.cwd();
+  const out = resolve(outputRoot, args.out ?? `.orgops-speech/speech-${Date.now()}.${format}`);
 
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
   const response = await fetch(`${baseUrl}/audio/speech`, {

@@ -23,10 +23,10 @@ Agents on a realtime voice call already speak natively; this skill is for text a
 ## How to reply with voice
 
 1. Write what you will say: conversational, short sentences, no markdown, no URLs, at most 4096 characters (aim for well under a minute of speech).
-2. Generate the audio from your workspace:
+2. Generate the audio (the file is written under `.orgops-speech/` in your workspace):
 
    ```bash
-   node --import tsx skills/speak/assets/speak.ts -- --text "Sure, the deploy finished at three and all checks passed."
+   node --import tsx {baseDir}/assets/speak.ts -- --text "Sure, the deploy finished at three and all checks passed."
    ```
 
    For longer or quote-heavy text, write it to a file first and pass `--text-file reply.txt`.

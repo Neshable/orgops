@@ -161,6 +161,7 @@ async function spawnTrackedProcess(
   const mergedEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
     ORGOPS_AGENT_NAME: ctx.agent.name,
+    ORGOPS_AGENT_WORKSPACE: resolveAgentPath(ctx.agent, ctx.agent.workspacePath, ctx.extraAllowedRoots ?? []),
     ...ctx.injectionEnv,
     ...input.env,
   };
