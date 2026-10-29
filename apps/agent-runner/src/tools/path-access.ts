@@ -1,5 +1,10 @@
+import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { Agent } from "../types";
+
+function canonicalPath(path: string) {
+  return existsSync(path) ? realpathSync(path) : path;
+}
 
 function isInside(root: string, candidate: string) {
   const rel = relative(root, candidate);
@@ -19,16 +24,16 @@ export function resolveAgentPath(
   extraAllowedRoots: string[] = [],
 ): string {
   const workspaceRoot = resolve(agent.workspacePath);
-  const candidate = isAbsolute(value)
+  const candidate = canonicalPath(isAbsolute(value)
     ? resolve(value)
-    : resolve(workspaceRoot, value);
+    : resolve(workspaceRoot, value));
   const allowedRoots = [
     ...getAllowedRoots(agent),
     ...extraAllowedRoots
       .map((root) => root.trim())
       .filter(Boolean)
       .map((root) => resolve(root)),
-  ];
+  ].map(canonicalPath);
   if (allowedRoots.some((root) => isInside(root, candidate))) {
     return candidate;
   }

@@ -5,10 +5,11 @@ import {
 import { Hono } from "hono";
 import {registerHttpBoundaries} from "./http-boundaries";
 import { createNodeWebSocket } from "@hono/node-ws";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  createHash,
   randomBytes,
   randomUUID,
   scryptSync,
@@ -30,6 +31,7 @@ import {
   EventSchema,
   type EventShapeDefinition,
   getCoreEventShapes,
+  resolveModelCapabilities,
   serializeEventShapes,
   validateEventAgainstShapes,
 } from "@orgops/schemas";
@@ -54,6 +56,11 @@ import { registerRunnersRoutes } from "./routes/runners";
 import { registerIntegrationKeysRoutes } from "./routes/integration-keys";
 import { registerEmbedRoutes } from "./routes/embed";
 import { registerBillingRoutes } from "./routes/billing";
+import { registerVoiceRoutes } from "./routes/voice";
+import { createVoiceTranscriber } from "./voice-transcriber";
+import { createRealtimeVoice } from "./voice-realtime";
+import { createVoiceBroker } from "./voice-broker";
+import type { transcribe as TranscribeFn } from "@orgops/llm";
 import { registerFederationRoutes } from "./routes/federation";
 import { registerWorkspacePublicationRoutes } from "./routes/workspace-publications";
 import {
@@ -77,6 +84,11 @@ export type AppConfig = {
   runnerToken?: string;
   runnerApiUrl?: string;
   projectRoot?: string;
+  /** Overrides speech-to-text for the channel transcriber (tests). */
+  voiceTranscribe?: typeof TranscribeFn;
+  voiceTranscriberEnv?: () => Record<string, string | undefined>;
+  /** Overrides the HTTP client used to create OpenAI realtime calls (tests). */
+  realtimeFetch?: typeof fetch;
 };
 
 type AppEnv = {
@@ -126,10 +138,12 @@ export function createApp(config: AppConfig = {}) {
     `http://localhost:${process.env.PORT ?? "8787"}`;
 
   const FILES_DIR = join(PROJECT_ROOT, "files");
+  const EVENT_PAYLOAD_BLOBS_DIR = join(DATA_DIR, "event-payloads");
   const SKILL_ROOTS = resolveSkillRoots(PROJECT_ROOT);
   let lastEventCreatedAt = 0;
 
   mkdirSync(FILES_DIR, { recursive: true });
+  mkdirSync(EVENT_PAYLOAD_BLOBS_DIR, { recursive: true });
 
   function hashPassword(password: string) {
     const salt = randomBytes(16).toString("hex");
@@ -282,6 +296,47 @@ export function createApp(config: AppConfig = {}) {
     }
   }
 
+  const MAX_EVENT_PAYLOAD_JSON_CHARS = 262_144;
+
+  function eventPayloadBlobRef(row: any) {
+    const storagePath = typeof row.payload_blob_storage_path === "string"
+      ? row.payload_blob_storage_path
+      : "";
+    if (!storagePath) return undefined;
+    return {
+      storage: "file",
+      eventId: row.id,
+      totalChars: row.payload_json_chars,
+      byteLength: row.payload_blob_byte_length,
+      sha256: row.payload_blob_sha256,
+    };
+  }
+
+  function parseEventPayload(payloadJson: unknown, payloadJsonChars?: unknown, maxChars = MAX_EVENT_PAYLOAD_JSON_CHARS): {
+    payload: unknown;
+    payloadTruncated: boolean;
+  } {
+    const originalLength =
+      typeof payloadJsonChars === "number" && Number.isFinite(payloadJsonChars)
+        ? payloadJsonChars
+        : typeof payloadJson === "string"
+          ? payloadJson.length
+          : null;
+    if (originalLength !== null && originalLength > maxChars) {
+      return {
+        payload: {
+          truncated: true,
+          omittedChars: originalLength - maxChars,
+        },
+        payloadTruncated: true,
+      };
+    }
+    if (typeof payloadJson !== "string") {
+      return { payload: {}, payloadTruncated: false };
+    }
+    return { payload: parseJson(payloadJson, {}), payloadTruncated: false };
+  }
+
   function parseStringArraySafe(input: string | null | undefined): string[] {
     if (!input) return [];
     try {
@@ -301,10 +356,17 @@ export function createApp(config: AppConfig = {}) {
   }
 
   function eventRowToApi(row: any) {
+    const { payload, payloadTruncated } = parseEventPayload(
+      row.payload_json,
+      row.payload_json_chars,
+      row.payload_max_chars,
+    );
+    const omitted = payloadTruncated || Boolean(row.payload_truncated);
+    const payloadRef = omitted ? eventPayloadBlobRef(row) : undefined;
     return {
       id: row.id,
       type: row.type,
-      payload: parseJson(row.payload_json, {}),
+      payload,
       source: row.source,
       channelId: row.channel_id ?? undefined,
       parentEventId: row.parent_event_id ?? undefined,
@@ -314,6 +376,8 @@ export function createApp(config: AppConfig = {}) {
       lastError: row.last_error ?? undefined,
       idempotencyKey: row.idempotency_key ?? undefined,
       createdAt: row.created_at,
+      ...(omitted ? { payloadTruncated: true } : {}),
+      ...(payloadRef ? { payloadRef } : {}),
     };
   }
 
@@ -447,7 +511,31 @@ export function createApp(config: AppConfig = {}) {
     const createdAt = Math.max(now, lastEventCreatedAt + 1);
     lastEventCreatedAt = createdAt;
     const id = input.id ?? randomUUID();
-    const payloadJson = JSON.stringify(input.payload ?? {});
+    const rawPayloadJson = JSON.stringify(input.payload ?? {});
+    const payloadBytes = Buffer.from(rawPayloadJson, "utf8");
+    const shouldSpillPayload = rawPayloadJson.length > MAX_EVENT_PAYLOAD_JSON_CHARS;
+    const payloadSha256 = createHash("sha256").update(payloadBytes).digest("hex");
+    const blobFileName = `${createHash("sha256").update(id).digest("hex")}.json`;
+    const blobStoragePath = join("event-payloads", blobFileName);
+    const blobAbsolutePath = join(DATA_DIR, blobStoragePath);
+    const blobTempPath = `${blobAbsolutePath}.${process.pid}.${Date.now()}.tmp`;
+    if (shouldSpillPayload) {
+      writeFileSync(blobTempPath, payloadBytes);
+      renameSync(blobTempPath, blobAbsolutePath);
+    }
+    const payloadJson = shouldSpillPayload
+      ? JSON.stringify({
+          truncated: true,
+          omittedChars: rawPayloadJson.length - MAX_EVENT_PAYLOAD_JSON_CHARS,
+          payloadRef: {
+            storage: "file",
+            eventId: id,
+            totalChars: rawPayloadJson.length,
+            byteLength: payloadBytes.length,
+            sha256: payloadSha256,
+          },
+        })
+      : rawPayloadJson;
     const row = {
       id,
       type: input.type,
@@ -461,41 +549,66 @@ export function createApp(config: AppConfig = {}) {
       last_error: null,
       idempotency_key: input.idempotencyKey ?? null,
       created_at: createdAt,
+      payload_json_chars: rawPayloadJson.length,
+      payload_blob_storage_path: shouldSpillPayload ? blobStoragePath : null,
+      payload_blob_byte_length: shouldSpillPayload ? payloadBytes.length : null,
+      payload_blob_sha256: shouldSpillPayload ? payloadSha256 : null,
     };
     const recipientAgents = resolveRecipientAgents();
     if (recipientAgents.length > 0 && input.status === undefined) {
       row.status = "PENDING";
     }
-    orm
-      .insert(schema.events)
-      .values({
-        id: row.id,
-        type: row.type,
-        payload_json: row.payload_json,
-        source: row.source,
-        channel_id: row.channel_id,
-        parent_event_id: row.parent_event_id,
-        deliver_at: row.deliver_at,
-        status: row.status,
-        fail_count: row.fail_count,
-        last_error: row.last_error,
-        idempotency_key: row.idempotency_key,
-        created_at: row.created_at,
-      })
-      .run();
-    if (recipientAgents.length > 0) {
-      orm
-        .insert(schema.eventReceipts)
-        .values(
-          recipientAgents.map((agentName) => ({
-            event_id: row.id,
-            agent_name: agentName,
-            status: row.status === "DELIVERED" ? "DELIVERED" : "PENDING",
-            delivered_at: row.status === "DELIVERED" ? row.created_at : null,
-          })),
-        )
-        .onConflictDoNothing()
-        .run();
+    try {
+      const writeRows = db.transaction(() => {
+        orm
+          .insert(schema.events)
+          .values({
+            id: row.id,
+            type: row.type,
+            payload_json: row.payload_json,
+            source: row.source,
+            channel_id: row.channel_id,
+            parent_event_id: row.parent_event_id,
+            deliver_at: row.deliver_at,
+            status: row.status,
+            fail_count: row.fail_count,
+            last_error: row.last_error,
+            idempotency_key: row.idempotency_key,
+            created_at: row.created_at,
+          })
+          .run();
+        if (shouldSpillPayload) {
+          orm
+            .insert(schema.eventPayloadBlobs)
+            .values({
+              event_id: row.id,
+              storage_path: blobStoragePath,
+              char_length: rawPayloadJson.length,
+              byte_length: payloadBytes.length,
+              sha256: payloadSha256,
+              created_at: row.created_at,
+            })
+            .run();
+        }
+        if (recipientAgents.length > 0) {
+          orm
+            .insert(schema.eventReceipts)
+            .values(
+              recipientAgents.map((agentName) => ({
+                event_id: row.id,
+                agent_name: agentName,
+                status: row.status === "DELIVERED" ? "DELIVERED" : "PENDING",
+                delivered_at: row.status === "DELIVERED" ? row.created_at : null,
+              })),
+            )
+            .onConflictDoNothing()
+            .run();
+        }
+      });
+      writeRows();
+    } catch (error) {
+      if (shouldSpillPayload) rmSync(blobAbsolutePath, { force: true });
+      throw error;
     }
     publishEvent(row);
     void pushFederatedEvent(row);
@@ -636,6 +749,7 @@ export function createApp(config: AppConfig = {}) {
     serializeEventShapes,
     access,
     verifyPassword:verifyPasswordAsync,
+    dataDir: DATA_DIR,
   });
 
   registerMemoryRoutes(app as any, { orm, jsonResponse, access });
@@ -708,6 +822,30 @@ export function createApp(config: AppConfig = {}) {
 
   registerIntegrationKeysRoutes(app as any, { orm, jsonResponse, access });
   registerEmbedRoutes(app as any, { orm, jsonResponse, insertEvent });
+  const voiceTranscriber = createVoiceTranscriber({
+    orm,
+    insertEvent,
+    transcribe: config.voiceTranscribe,
+    env: config.voiceTranscriberEnv,
+  });
+  bus.subscribe("org:events", (message: any) => {
+    if (message?.data) voiceTranscriber.handleEvent(message.data);
+  });
+  const realtimeVoice = createRealtimeVoice({
+    orm,
+    insertEvent,
+    access,
+    fetch: config.realtimeFetch,
+  });
+  const voiceBroker = createVoiceBroker({ orm, access });
+  registerVoiceRoutes(app as any, {
+    jsonResponse,
+    requireAuth,
+    requireRunnerAuth,
+    voiceTranscriber,
+    realtimeVoice,
+    voiceBroker,
+  });
   registerBillingRoutes(app as any, {
     orm,
     jsonResponse,
@@ -716,7 +854,7 @@ export function createApp(config: AppConfig = {}) {
     requireRunnerAuth,
   });
 
-  return { app, db, bus, injectWebSocket };
+  return { app, db, bus, injectWebSocket, voiceTranscriber };
 }
 
 const SYSTEM_AGENT_NAME = "system";
@@ -725,12 +863,16 @@ const DEFAULT_MODEL_NAME_BY_PROVIDER = {
   openai: "gpt-5.2",
   anthropic: "claude-3-5-sonnet-latest",
   openrouter: "openai/gpt-4o-mini",
+  mistral: "mistral-small-latest",
+  liquid: "lfm3",
 } as const;
 
 const PROVIDER_API_KEY_ENV = {
   openai: "OPENAI_API_KEY",
   anthropic: "ANTHROPIC_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
+  mistral: "MISTRAL_API_KEY",
+  liquid: "LIQUID_API_KEY",
 } as const;
 
 type SystemAgentProvider = keyof typeof DEFAULT_MODEL_NAME_BY_PROVIDER;
@@ -740,6 +882,8 @@ function normalizeSystemAgentProvider(raw: string): SystemAgentProvider | null {
   if (normalized === "openai") return "openai";
   if (normalized === "anthropic" || normalized === "claude") return "anthropic";
   if (normalized === "openrouter" || normalized === "or") return "openrouter";
+  if (normalized === "mistral" || normalized === "mistralai") return "mistral";
+  if (normalized === "liquid" || normalized === "liquidai") return "liquid";
   return null;
 }
 
@@ -844,7 +988,9 @@ function seedDefaultSystemAgent(
           provider: resolved.provider,
           model_name: resolved.modelName,
           enabled: 1,
-          defaults_json: "{}",
+          defaults_json: JSON.stringify({
+            capabilities: resolveModelCapabilities(resolved.provider, resolved.modelName, {}),
+          }),
           created_at: now,
         })
         .run();

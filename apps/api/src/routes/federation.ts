@@ -1,7 +1,7 @@
 import type { Hono } from "hono";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { CHANNEL_KINDS, CHANNEL_VISIBILITY, schema, type OrgOpsDrizzleDb } from "@orgops/db";
-import { and, asc, eq, gt } from "drizzle-orm";
+import { and, asc, eq, gt, sql } from "drizzle-orm";
 import type { AgentTransferBundle, createAgentTransfer } from "../agent-transfer";
 import type {AccessControl} from './access';
 import {federationFetch,federationUrl} from '../federation-transport';
@@ -22,6 +22,32 @@ type FederationDeps = {
 const FEDERATION_ROLES = new Set(["LOCAL_HOME", "REMOTE_PROJECTION"]);
 const DEFAULT_FEDERATION_SYNC_INTERVAL_MS = 15_000;
 const FEDERATION_PARTICIPANT_TYPES = new Set(["AGENT", "HUMAN", "TEAM"]);
+const MAX_EVENT_PAYLOAD_JSON_CHARS = 262_144;
+
+function compactEventRowSelectFields() {
+  const blobCharLength = sql<number | null>`(SELECT ${schema.eventPayloadBlobs.char_length} FROM ${schema.eventPayloadBlobs} WHERE ${schema.eventPayloadBlobs.event_id} = ${schema.events.id})`;
+  const blobByteLength = sql<number | null>`(SELECT ${schema.eventPayloadBlobs.byte_length} FROM ${schema.eventPayloadBlobs} WHERE ${schema.eventPayloadBlobs.event_id} = ${schema.events.id})`;
+  const blobSha256 = sql<string | null>`(SELECT ${schema.eventPayloadBlobs.sha256} FROM ${schema.eventPayloadBlobs} WHERE ${schema.eventPayloadBlobs.event_id} = ${schema.events.id})`;
+  const blobStoragePath = sql<string | null>`(SELECT ${schema.eventPayloadBlobs.storage_path} FROM ${schema.eventPayloadBlobs} WHERE ${schema.eventPayloadBlobs.event_id} = ${schema.events.id})`;
+  return {
+    id: schema.events.id,
+    type: schema.events.type,
+    payload_json: sql<string | null>`CASE WHEN length(${schema.events.payload_json}) > ${MAX_EVENT_PAYLOAD_JSON_CHARS} THEN NULL ELSE ${schema.events.payload_json} END`,
+    payload_json_chars: sql<number>`COALESCE(${blobCharLength}, length(${schema.events.payload_json}))`,
+    payload_blob_storage_path: blobStoragePath,
+    payload_blob_byte_length: blobByteLength,
+    payload_blob_sha256: blobSha256,
+    source: schema.events.source,
+    channel_id: schema.events.channel_id,
+    parent_event_id: schema.events.parent_event_id,
+    deliver_at: schema.events.deliver_at,
+    status: schema.events.status,
+    fail_count: schema.events.fail_count,
+    last_error: schema.events.last_error,
+    idempotency_key: schema.events.idempotency_key,
+    created_at: schema.events.created_at,
+  };
+}
 
 function parseJsonRecordSafe(input: string | null | undefined): Record<string, unknown> {
   if (!input) return {};
@@ -157,7 +183,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
   }) {
     const idempotencyKey = remoteEventIdempotencyKey(input.homeInstanceId, input.remoteEventId);
     const existing = orm
-      .select()
+      .select(compactEventRowSelectFields())
       .from(schema.events)
       .where(eq(schema.events.idempotency_key, idempotencyKey))
       .get() as any;
@@ -1091,7 +1117,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
       clauses.push(gt(schema.events.created_at, after));
     }
     const rows = orm
-      .select()
+      .select(compactEventRowSelectFields())
       .from(schema.events)
       .where(and(...(clauses as [any, ...any[]])))
       .orderBy(asc(schema.events.created_at))
@@ -1123,7 +1149,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     const idempotencyKey=identity?remoteEventIdempotencyKey(auth.peer.id,`${channelId}:${identity}`):undefined;
     if (idempotencyKey) {
       const existing = orm
-        .select()
+        .select(compactEventRowSelectFields())
         .from(schema.events)
         .where(eq(schema.events.idempotency_key, idempotencyKey))
         .get() as any;
