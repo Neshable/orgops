@@ -68,7 +68,7 @@ function redactIntegrationTokenStrings(value: unknown): unknown {
 function truncatePersistedToolOutput(output: unknown): { output: unknown; truncated: boolean } {
   let serialized: string;
   try {
-    serialized = JSON.stringify(output);
+    serialized = JSON.stringify(output) ?? String(output);
   } catch {
     serialized = String(output);
   }

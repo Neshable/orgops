@@ -25,6 +25,7 @@ function isRealtimeVoiceTranscript(payload: unknown): boolean {
 }
 
 export function shouldHandleEventForAgent(agent: Agent, event: Event): boolean {
+  if (event.payloadTruncated) return false;
   if (event.type?.startsWith("agent.control.")) return false;
   // Turn lifecycle events are runner bookkeeping, not actionable input.
   if (event.type?.startsWith("agent.turn.")) return false;

@@ -318,7 +318,7 @@ export function createApp(config: AppConfig = {}) {
     };
   }
 
-  function parseEventPayload(payloadJson: unknown, payloadJsonChars?: unknown): {
+  function parseEventPayload(payloadJson: unknown, payloadJsonChars?: unknown, maxChars = MAX_EVENT_PAYLOAD_JSON_CHARS): {
     payload: unknown;
     payloadTruncated: boolean;
   } {
@@ -328,11 +328,11 @@ export function createApp(config: AppConfig = {}) {
         : typeof payloadJson === "string"
           ? payloadJson.length
           : null;
-    if (originalLength !== null && originalLength > MAX_EVENT_PAYLOAD_JSON_CHARS) {
+    if (originalLength !== null && originalLength > maxChars) {
       return {
         payload: {
           truncated: true,
-          omittedChars: originalLength - MAX_EVENT_PAYLOAD_JSON_CHARS,
+          omittedChars: originalLength - maxChars,
         },
         payloadTruncated: true,
       };
@@ -365,8 +365,10 @@ export function createApp(config: AppConfig = {}) {
     const { payload, payloadTruncated } = parseEventPayload(
       row.payload_json,
       row.payload_json_chars,
+      row.payload_max_chars,
     );
-    const payloadRef = payloadTruncated ? eventPayloadBlobRef(row) : undefined;
+    const omitted = payloadTruncated || Boolean(row.payload_truncated);
+    const payloadRef = omitted ? eventPayloadBlobRef(row) : undefined;
     return {
       id: row.id,
       type: row.type,
@@ -380,7 +382,7 @@ export function createApp(config: AppConfig = {}) {
       lastError: row.last_error ?? undefined,
       idempotencyKey: row.idempotency_key ?? undefined,
       createdAt: row.created_at,
-      ...(payloadTruncated ? { payloadTruncated: true } : {}),
+      ...(omitted ? { payloadTruncated: true } : {}),
       ...(payloadRef ? { payloadRef } : {}),
     };
   }
