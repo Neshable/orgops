@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { decryptSecret, parseMasterKey } from "@orgops/crypto";
+import { decryptSecret, encryptSecret, parseMasterKey } from "@orgops/crypto";
 import { createDrizzleDb, migrate, openDb, schema } from "@orgops/db";
 import { createApp } from "./app";
 
@@ -96,9 +96,11 @@ describe("api app", () => {
     const previousMasterKey = process.env.ORGOPS_MASTER_KEY;
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    const previousMistralKey = process.env.MISTRAL_API_KEY;
     process.env.ORGOPS_MASTER_KEY = masterKey;
     process.env.OPENAI_API_KEY = "sk-test-openai";
     delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.MISTRAL_API_KEY;
 
     try {
       const unconfiguredDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
@@ -209,6 +211,34 @@ describe("api app", () => {
         modelName: "gpt-4o-mini",
         enabled: 1,
       });
+      const mistralDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+      const mistralDb = openDb(":memory:");
+      process.env.MISTRAL_API_KEY = "sk-test-mistral";
+      createApp({
+        db: mistralDb,
+        dataDir: mistralDir,
+        adminUser: "admin",
+        adminPass: "admin",
+        systemAgentModel: "mistral:voxtral-mini-transcribe-realtime-3",
+      });
+      const mistralOrm = createDrizzleDb(mistralDb);
+      const mistralModel = mistralOrm
+        .select({
+          provider: schema.models.provider,
+          modelName: schema.models.model_name,
+          defaultsJson: schema.models.defaults_json,
+        })
+        .from(schema.models)
+        .where(eq(schema.models.id, "mistral:voxtral-mini-transcribe-realtime-3"))
+        .get() as
+        | { provider: string; modelName: string; defaultsJson: string }
+        | undefined;
+      expect(mistralModel?.provider).toBe("mistral");
+      expect(JSON.parse(mistralModel?.defaultsJson ?? "{}").capabilities).toMatchObject({
+        audioInput: true,
+        realtimeAudioInput: true,
+      });
+      rmSync(mistralDir, { recursive: true, force: true });
       rmSync(dataDir, { recursive: true, force: true });
     } finally {
       if (previousMasterKey === undefined) delete process.env.ORGOPS_MASTER_KEY;
@@ -217,6 +247,8 @@ describe("api app", () => {
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
       if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+      if (previousMistralKey === undefined) delete process.env.MISTRAL_API_KEY;
+      else process.env.MISTRAL_API_KEY = previousMistralKey;
     }
   });
 
@@ -5120,6 +5152,163 @@ describe("api app", () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
+  it("honors explicit limit even when all=1", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+    const db = openDb(":memory:");
+    const { app } = createApp({
+      db,
+      dataDir,
+      adminUser: "admin",
+      adminPass: "admin",
+      runnerToken: "test-token",
+    });
+
+    const loginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "admin" }),
+    });
+    expect(loginRes.status).toBe(200);
+    const cookie = loginRes.headers.get("set-cookie") ?? "";
+
+    const insert = db.prepare(
+      "INSERT INTO events (id, type, payload_json, source, channel_id, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    );
+    for (let index = 0; index < 20; index += 1) {
+      insert.run(`limit-${index}`, "message.created", "{}", "human:admin", null, index, "DELIVERED");
+    }
+
+    const listRes = await app.request(
+      "http://localhost/api/events?all=1&limit=5&order=asc",
+      { headers: { cookie } },
+    );
+    expect(listRes.status).toBe(200);
+    expect(((await listRes.json()) as unknown[]).length).toBe(5);
+
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("does not JSON-parse oversized event payloads in listings", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+    const db = openDb(":memory:");
+    const { app } = createApp({
+      db,
+      dataDir,
+      adminUser: "admin",
+      adminPass: "admin",
+      runnerToken: "test-token",
+    });
+
+    const loginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "admin" }),
+    });
+    expect(loginRes.status).toBe(200);
+    const cookie = loginRes.headers.get("set-cookie") ?? "";
+
+    const legacyPayloadJson = JSON.stringify({ blob: "n".repeat(300_000) });
+    db.prepare(
+      "INSERT INTO events (id, type, payload_json, source, channel_id, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      "huge-1",
+      "tool.executed",
+      legacyPayloadJson,
+      "agent:tester",
+      null,
+      1,
+      "DELIVERED",
+    );
+
+    const listRes = await app.request("http://localhost/api/events?order=asc", {
+      headers: { cookie },
+    });
+    expect(listRes.status).toBe(200);
+    const list = (await listRes.json()) as Array<{
+      id: string;
+      payloadTruncated?: boolean;
+      payload?: { truncated?: boolean };
+    }>;
+    expect(list[0]?.id).toBe("huge-1");
+    expect(list[0]?.payloadTruncated).toBe(true);
+    expect(list[0]?.payload?.truncated).toBe(true);
+
+    const chunkRes = await app.request(
+      "http://localhost/api/events/huge-1/payload?offset=10&limit=25",
+      { headers: { cookie } },
+    );
+    expect(chunkRes.status).toBe(200);
+    const chunk = (await chunkRes.json()) as {
+      storage?: string;
+      totalChars?: number;
+      offset?: number;
+      chunk?: string;
+      nextOffset?: number;
+      done?: boolean;
+    };
+    expect(chunk.storage).toBe("db");
+    expect(chunk.totalChars).toBe(legacyPayloadJson.length);
+    expect(chunk.offset).toBe(10);
+    expect(chunk.chunk).toBe(legacyPayloadJson.slice(10, 35));
+    expect(chunk.nextOffset).toBe(35);
+    expect(chunk.done).toBe(false);
+
+    const postedPayload = { tool: "probe", output: "x".repeat(300_000) };
+    const postRes = await app.request("http://localhost/api/events", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        type: "tool.executed",
+        source: "agent:tester",
+        payload: postedPayload,
+      }),
+    });
+    expect(postRes.status).toBe(201);
+    const posted = (await postRes.json()) as {
+      id: string;
+      payloadTruncated?: boolean;
+      payloadRef?: { storage?: string; totalChars?: number; sha256?: string };
+    };
+    expect(posted.payloadTruncated).toBe(true);
+    expect(posted.payloadRef?.storage).toBe("file");
+
+    const storedEvent = db
+      .prepare("SELECT payload_json FROM events WHERE id = ?")
+      .get(posted.id) as { payload_json: string };
+    expect(storedEvent.payload_json.length).toBeLessThan(1_000);
+    const blob = db
+      .prepare("SELECT storage_path, char_length, byte_length, sha256 FROM event_payload_blobs WHERE event_id = ?")
+      .get(posted.id) as {
+        storage_path: string;
+        char_length: number;
+        byte_length: number;
+        sha256: string;
+      };
+    const postedPayloadJson = JSON.stringify(postedPayload);
+    expect(blob.char_length).toBe(postedPayloadJson.length);
+    expect(blob.byte_length).toBe(Buffer.byteLength(postedPayloadJson, "utf8"));
+    expect(blob.sha256).toBe(createHash("sha256").update(postedPayloadJson).digest("hex"));
+    expect(existsSync(join(dataDir, blob.storage_path))).toBe(true);
+
+    const fileChunkRes = await app.request(
+      `http://localhost/api/events/${encodeURIComponent(posted.id)}/payload?offset=20&limit=30`,
+      { headers: { cookie } },
+    );
+    expect(fileChunkRes.status).toBe(200);
+    const fileChunk = (await fileChunkRes.json()) as {
+      storage?: string;
+      totalChars?: number;
+      chunk?: string;
+      sha256?: string;
+    };
+    expect(fileChunk.storage).toBe("file");
+    expect(fileChunk.totalChars).toBe(postedPayloadJson.length);
+    expect(fileChunk.chunk).toBe(postedPayloadJson.slice(20, 50));
+    expect(fileChunk.sha256).toBe(blob.sha256);
+
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
   it("pages older events with before", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
     const db = openDb(":memory:");
@@ -8034,7 +8223,7 @@ describe("api app", () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it("resolves secret env precedence as private > team > public > package", async () => {
+  it("resolves secret env precedence as private > team > public", async () => {
     const previousMasterKey = process.env.ORGOPS_MASTER_KEY;
     process.env.ORGOPS_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
     const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
@@ -8109,7 +8298,6 @@ describe("api app", () => {
     }
 
     const createSecrets = [
-      { name: "OPENAI_API_KEY", scopeType: "package", scopeId: "llm", value: "pkg-key" },
       { name: "OPENAI_API_KEY", scopeType: "public", scopeId: null, value: "public-key" },
       { name: "OPENAI_API_KEY", scopeType: "private", scopeId: "agent-a", value: "private-key-a" },
       { name: "ANTHROPIC_API_KEY", scopeType: "public", scopeId: null, value: "anth-public" },
@@ -8217,6 +8405,108 @@ describe("api app", () => {
     expect(envRes.status).toBe(200);
     const env = (await envRes.json()) as Record<string, string>;
     expect(env.CURSOR_API_KEY).toBe("cursor-token");
+
+    if (previousMasterKey === undefined) delete process.env.ORGOPS_MASTER_KEY;
+    else process.env.ORGOPS_MASTER_KEY = previousMasterKey;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("rejects package scope writes and still injects stored package secrets", async () => {
+    const previousMasterKey = process.env.ORGOPS_MASTER_KEY;
+    process.env.ORGOPS_MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    const dataDir = mkdtempSync(join(tmpdir(), "orgops-api-"));
+    const db = openDb(":memory:");
+    const { app } = createApp({
+      db,
+      dataDir,
+      adminUser: "admin",
+      adminPass: "admin",
+      runnerToken: "test-token",
+    });
+
+    const loginRes = await app.request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "admin" }),
+    });
+    expect(loginRes.status).toBe(200);
+    const cookie = loginRes.headers.get("set-cookie") ?? "";
+
+    const createAgentRes = await app.request("http://localhost/api/agents", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        name: "ATLE dev",
+        modelId: "openai:gpt-4o-mini",
+        workspacePath: ".orgops-data/workspaces/atle-dev",
+      }),
+    });
+    expect(createAgentRes.status).toBe(201);
+
+    const rejected = await app.request("http://localhost/api/secrets", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({ package: "llm", key: "OPENAI_API_KEY", value: "first-key" }),
+    });
+    expect(rejected.status).toBe(400);
+
+    const orm = createDrizzleDb(db);
+    const masterKey = parseMasterKey(process.env.ORGOPS_MASTER_KEY ?? "");
+    orm
+      .insert(schema.secrets)
+      .values({
+        id: randomUUID(),
+        name: "OPENAI_API_KEY",
+        scope_type: "package",
+        scope_id: "llm",
+        ciphertext_b64: encryptSecret(masterKey, "stale-package-key"),
+        created_at: Date.now(),
+      })
+      .run();
+
+    const privateSecret = await app.request("http://localhost/api/secrets", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        key: "ATLE_OPENAI_API_KEY",
+        value: "agent-key",
+        scopeType: "private",
+        scopeId: "ATLE dev",
+      }),
+    });
+    expect(privateSecret.status).toBe(201);
+
+    const envRes = await app.request("http://localhost/api/secrets/env", {
+      headers: {
+        "x-orgops-runner-token": "test-token",
+        "x-orgops-agent-name": "ATLE dev",
+      },
+    });
+    expect(envRes.status).toBe(200);
+    const env = (await envRes.json()) as Record<string, string>;
+    expect(env.OPENAI_API_KEY).toBe("stale-package-key");
+    expect(env.ATLE_OPENAI_API_KEY).toBe("agent-key");
+
+    const override = await app.request("http://localhost/api/secrets", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        key: "OPENAI_API_KEY",
+        value: "public-key",
+        scopeType: "public",
+      }),
+    });
+    expect(override.status).toBe(201);
+
+    const overriddenRes = await app.request("http://localhost/api/secrets/env", {
+      headers: {
+        "x-orgops-runner-token": "test-token",
+        "x-orgops-agent-name": "ATLE dev",
+      },
+    });
+    expect(overriddenRes.status).toBe(200);
+    const overridden = (await overriddenRes.json()) as Record<string, string>;
+    expect(overridden.OPENAI_API_KEY).toBe("public-key");
 
     if (previousMasterKey === undefined) delete process.env.ORGOPS_MASTER_KEY;
     else process.env.ORGOPS_MASTER_KEY = previousMasterKey;

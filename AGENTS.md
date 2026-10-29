@@ -16,6 +16,7 @@ npm run dev:all               # API :8787 + UI :5173 + runner (runner waits for 
 npm run dev:all:clean         # same, but wipes runtime state first
 npm run dev                   # API only
 npm run prod:all              # builds UI, then API + UI preview + runner
+npm run livekit               # local LiveKit SFU for voice rooms (`brew install livekit`)
 
 npm test                      # vitest run (whole repo)
 npm run lint                  # tsc --noEmit across every workspace (there is no eslint)
@@ -71,7 +72,7 @@ Runners consume via per-agent receipts (at-least-once). `deliverAt` schedules fu
 
 ### Turn execution
 
-Pending events are grouped by channel and processed as **one batch per `(agent, channel)`** — a burst becomes a single turn, not N turns. `channel-loop.ts` serializes work per key and marks the pair busy so polling skips it. During a CLASSIC turn, `turn-executor.ts` runs the model step-by-step and polls for newly arrived same-channel events *between* steps, merging them into the next attempt (`reconcileLateInjectedMessages`, `selectRecentDeltaEventsForPrompt`). This mid-turn injection is the subtlest behavior in the codebase.
+Pending events are grouped by channel and processed as **one batch per `(agent, channel)`** — a burst becomes a single turn, not N turns. `channel-loop.ts` serializes work per key and marks the pair busy so polling skips it. During a CLASSIC turn, `turn-executor.ts` runs the model step-by-step and polls for newly arrived same-channel events *between* steps, merging them into the next attempt (`reconcileLateInjectedMessages`). This mid-turn injection is the subtlest behavior in the codebase.
 
 `prompt-composer.ts` builds context from system prompt + bounded channel history + enabled skill markdown + soul file + memory summaries, with char/token budgeting.
 

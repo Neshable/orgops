@@ -14,6 +14,7 @@
     "@orgops/crypto": "file:../../packages/crypto",
     "@orgops/db": "file:../../packages/db",
     "@orgops/event-bus": "file:../../packages/event-bus",
+    "@orgops/llm": "file:../../packages/llm",
     "@orgops/schemas": "file:../../packages/schemas",
     "@orgops/skills": "file:../../packages/skills",
     "drizzle-orm": "^0.45.2",

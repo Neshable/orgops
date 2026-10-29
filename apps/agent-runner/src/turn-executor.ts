@@ -9,11 +9,14 @@ import {
   type LlmUsage,
 } from "@orgops/llm";
 import { getModel } from "models-dev-db";
+import { z } from "zod";
 import { listSkillsFromRoots, loadSkillEventShapes } from "@orgops/skills";
 import {
   type EventValidationResult,
   type EventTypeSummary,
   getCoreEventShapes,
+  inferModelCapabilities,
+  resolveReplyContract,
   serializeEventShapes,
   validateEventAgainstShapes,
 } from "@orgops/schemas";
@@ -21,11 +24,10 @@ import { createRunnerTools, executeTool } from "./tools";
 import { pullInjectedEventMessages } from "./channel-injection";
 import { shouldHandleEventForAgent } from "./event-routing";
 import { getReservedEventTypeError } from "./event-type-guard";
-import { buildRunnerGuidance } from "./prompt";
+import { buildRunnerGuidance, NOOP_TOOL_NAME } from "./prompt";
 import { runRlmEventInChild } from "./rlm-process";
 import { runWrappedAgentTurn } from "./wrapped-runtime";
 import {
-  buildChannelRecentDeltaSystemMessage,
   buildSystemMemoryMessage,
   getChannelFullMemoryRecord,
   getChannelRecentMemoryRecord,
@@ -36,10 +38,10 @@ import {
 } from "./context-maintenance";
 import {
   buildModelMessages,
+  computeHistoryBudgetChars,
   contentCharLength,
   contentForTelemetry,
   estimateContextUsage,
-  selectRecentDeltaEventsForPrompt,
 } from "./prompt-composer";
 import { recordLlmUsage } from "./billing";
 import type { Agent, Event } from "./types";
@@ -269,6 +271,12 @@ function formatValidationErrors(validation: EventValidationResult): string {
     .join("\n");
 }
 
+function generateUsedTools(result: GenerateResult): boolean {
+  if ((result.toolCalls?.length ?? 0) > 0) return true;
+  if ((result.toolResults?.length ?? 0) > 0) return true;
+  return result.finishReason === "tool-calls";
+}
+
 function buildFallbackMessageEvent(
   agentName: string,
   channelId: string,
@@ -299,6 +307,12 @@ function normalizeModelMetadataProvider(provider: string) {
   return normalized;
 }
 
+function inferModelCapabilitiesForId(modelId: string) {
+  const separator = modelId.indexOf(":");
+  if (separator <= 0) return {};
+  return inferModelCapabilities(modelId.slice(0, separator), modelId.slice(separator + 1));
+}
+
 function resolveFallbackModelContextWindowTokens(modelId: string): number {
   const normalized = modelId.toLowerCase();
   if (normalized.includes("gpt-4o-mini")) return 128_000;
@@ -310,7 +324,12 @@ function resolveFallbackModelContextWindowTokens(modelId: string): number {
   return FALLBACK_MODEL_CONTEXT_WINDOW_TOKENS;
 }
 
-async function resolveModelContextWindowTokens(modelId: string): Promise<number> {
+async function resolveModelContextWindowTokens(agent: Agent): Promise<number> {
+  const declared = agent.modelCapabilities?.contextWindowTokens;
+  if (typeof declared === "number" && declared > 0) return Math.floor(declared);
+  const inferred = inferModelCapabilitiesForId(agent.modelId).contextWindowTokens;
+  if (inferred) return inferred;
+  const modelId = agent.modelId;
   const cached = modelContextWindowCache.get(modelId);
   if (cached) return cached;
   const pending = (async () => {
@@ -541,6 +560,8 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       .join("\n\n");
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
+    const plainTextReplies =
+      resolveReplyContract(agent.modelId, agent.modelCapabilities) === "plain-text";
     const runnerGuidance = buildRunnerGuidance(
       nowMs,
       nowIso,
@@ -554,6 +575,7 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         shell: process.env.SHELL ?? process.env.ComSpec ?? "unknown",
         nodeVersion: process.version,
       },
+      { replyContract: plainTextReplies ? "plain-text" : "json", agentName: agent.name },
     );
     const memoryContextMode = resolveAgentMemoryContextMode(agent);
     let eventHistory: Event[] = [];
@@ -575,22 +597,12 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
           : undefined,
       );
       eventHistory = getMeaningfulEvents(rawDeltaEvents);
-      const recentDeltaForSystemContext = selectRecentDeltaEventsForPrompt(
-        agent,
-        eventHistory,
-      );
       systemContextMessages = [
         channelRecentMemory?.summaryText
           ? buildSystemMemoryMessage(
               `Channel Recent Summary (last 10 minutes, ${channelId})`,
               channelRecentMemory.summaryText,
             )
-          : "",
-        recentDeltaForSystemContext.length > 0
-          ? buildChannelRecentDeltaSystemMessage({
-              channelId,
-              events: recentDeltaForSystemContext,
-            })
           : "",
         channelFullMemory?.summaryText
           ? buildSystemMemoryMessage(
@@ -632,9 +644,16 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
     ]
       .filter(Boolean)
       .join("\n\n");
+    const contextWindowTokens = await resolveModelContextWindowTokens(agent);
+    const historyMaxChars = computeHistoryBudgetChars({
+      contextWindowTokens,
+      system,
+      systemContextMessages,
+    });
     const baseMessages = await buildModelMessages(agent, system, eventHistory, {
       systemContextMessages,
       apiFetch: input.api.apiFetch,
+      historyMaxChars,
     });
     const mergedTriggerMessage =
       events.length > 1
@@ -696,7 +715,6 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       0,
     );
     const estimatedUsedTokens = estimateContextUsage(invokeMessages);
-    const contextWindowTokens = await resolveModelContextWindowTokens(agent.modelId);
     const estimatedAvailableTokens = Math.max(0, contextWindowTokens - estimatedUsedTokens);
     const utilizationPct =
       contextWindowTokens > 0
@@ -719,6 +737,7 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
             systemChars,
             systemContextChars,
             historyChars: Math.max(0, totalPromptChars - systemChars - systemContextChars),
+            historyMaxChars,
             triggerEventId: triggerEvent.id,
             ...payload,
           },
@@ -768,14 +787,37 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
     if (loadedSkillEventShapes.errors.length > 0) {
       console.warn("skill event shape load errors", loadedSkillEventShapes.errors);
     }
-    const tools = createRunnerTools({
+    let postedMessageToChannel = false;
+    const runnerTools = createRunnerTools({
       agent,
       event: triggerEvent,
       channelId,
-      runTool: (tool, args) => executeTool(executeCtx, tool, args),
+      runTool: async (tool, args) => {
+        const output = await executeTool(executeCtx, tool, args);
+        const emitted = output as { channelId?: unknown; event?: { type?: unknown; deliverAt?: unknown } };
+        if (
+          tool === "events_emit" &&
+          emitted?.channelId === channelId &&
+          emitted.event?.type === "message.created" &&
+          !emitted.event.deliverAt
+        ) {
+          postedMessageToChannel = true;
+        }
+        return output;
+      },
       apiFetch: input.api.apiFetch,
       emitEvent: input.api.emitEvent,
     });
+    const tools = plainTextReplies
+      ? {
+          ...runnerTools,
+          // No execute: the model loop stops on this call and the runner ends the turn silently.
+          [NOOP_TOOL_NAME]: {
+            description: "Finish your turn without posting a reply.",
+            inputSchema: z.object({ reason: z.string().optional() }),
+          },
+        }
+      : runnerTools;
     if ((agent.mode ?? "CLASSIC") === "RLM_REPL") {
       await runRlmEventInChild({
         agent,
@@ -876,6 +918,50 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         maxAttempts: MAX_EVENT_DISPATCH_ATTEMPTS,
       });
       if (hasLateInjectedEvents) continue;
+      if (!responseText.trim()) {
+        if (postedMessageToChannel) {
+          await emitTurnEvent("agent.turn.completed", {});
+          return;
+        }
+        if (plainTextReplies || generateUsedTools(result)) {
+          await emitTurnEvent("agent.turn.completed", { noReply: true });
+          return;
+        }
+        retryMessages.push({
+          role: "system",
+          content: [
+            `Your previous response was empty on attempt ${attempt}/${MAX_EVENT_DISPATCH_ATTEMPTS}.`,
+            "Return only a JSON event object.",
+          ].join("\n"),
+        });
+        continue;
+      }
+      if (plainTextReplies) {
+        const reply = responseText.trim();
+        const calledNoop = (result.toolCalls ?? []).some(
+          (call) => (call as { toolName?: unknown }).toolName === NOOP_TOOL_NAME,
+        );
+        if (calledNoop || !reply) {
+          await emitTurnEvent("agent.turn.completed", { noReply: true });
+          return;
+        }
+        // The model already replied here via events_emit; posting its final text too would duplicate it.
+        if (postedMessageToChannel) {
+          await emitTurnEvent("agent.turn.completed", {});
+          return;
+        }
+        if (!/^(\{|```)/.test(reply)) {
+          await input.api.emitEvent({
+            type: "message.created",
+            source: `agent:${agent.name}`,
+            channelId,
+            payload: { text: reply },
+            parentEventId: triggerEvent.id,
+          });
+          await emitTurnEvent("agent.turn.completed", {});
+          return;
+        }
+      }
       let parsed: unknown;
       try {
         parsed = extractJsonObject(responseText);
@@ -943,6 +1029,10 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       }
       await input.api.emitEvent(eventDraft);
       await emitTurnEvent("agent.turn.completed", {});
+      return;
+    }
+    if (!lastResponseText.trim() || postedMessageToChannel) {
+      await emitTurnEvent("agent.turn.completed", postedMessageToChannel ? {} : { noReply: true });
       return;
     }
     await input.api.emitEvent(

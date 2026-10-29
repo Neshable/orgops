@@ -11,7 +11,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import { decryptSecret, encryptSecret, parseMasterKey } from "@orgops/crypto";
 import { schema, type OrgOpsDrizzleDb } from "@orgops/db";
-import { and, eq, or } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { listSkills, type SkillRoot } from "@orgops/skills";
 
 const SKIP_DIR_NAMES = new Set(["node_modules", ".git"]);
@@ -93,7 +93,7 @@ export function createAgentTransfer(deps: {
       .select({ name: schema.secrets.name, scope_type: schema.secrets.scope_type })
       .from(schema.secrets)
       .where(
-        or(eq(schema.secrets.scope_type, "public"), eq(schema.secrets.scope_type, "package")),
+        eq(schema.secrets.scope_type, "public"),
       )
       .all() as Array<{ name: string; scope_type: string }>;
     return new Set(rows.map((row) => row.name));
