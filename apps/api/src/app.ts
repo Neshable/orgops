@@ -12,7 +12,6 @@ import {
   randomBytes,
   randomUUID,
   scryptSync,
-  timingSafeEqual,
 } from "node:crypto";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 
@@ -70,6 +69,7 @@ import {
 } from "./agent-invite-auth";
 import { registerAgentInviteRoutes } from "./routes/agent-invites";
 import { createAccessControl } from "./routes/access";
+import {hashPasswordAsync,verifyPasswordAsync} from './passwords';
 
 export type AppConfig = {
   db?: OrgOpsDb;
@@ -148,15 +148,6 @@ export function createApp(config: AppConfig = {}) {
     return `scrypt$${salt}$${derived}`;
   }
 
-  function verifyPassword(password: string, hashed: string) {
-    const [algo, salt, storedHash] = hashed.split("$");
-    if (algo !== "scrypt" || !salt || !storedHash) return false;
-    const computedHash = scryptSync(password, salt, 64).toString("hex");
-    const storedBytes = Buffer.from(storedHash, "hex");
-    const computedBytes = Buffer.from(computedHash, "hex");
-    if (storedBytes.length !== computedBytes.length) return false;
-    return timingSafeEqual(storedBytes, computedBytes);
-  }
 
   const existingHuman = orm
     .select({ id: schema.humans.id })
@@ -643,8 +634,8 @@ export function createApp(config: AppConfig = {}) {
     AuthLoginSchema,
     jsonResponse,
     requireAuth,
-    hashPassword,
-    verifyPassword,
+    hashPassword:hashPasswordAsync,
+    verifyPassword:verifyPasswordAsync,
   });
 
   registerHumansRoutes(app as any, {
@@ -716,7 +707,7 @@ export function createApp(config: AppConfig = {}) {
     resolveWorkspacePath,
     access,
     hashPassword,
-    verifyPassword,
+    verifyPassword:verifyPasswordAsync,
     insertEvent,
   });
 
@@ -755,7 +746,7 @@ export function createApp(config: AppConfig = {}) {
     validateEventAgainstShapes,
     serializeEventShapes,
     access,
-    verifyPassword,
+    verifyPassword:verifyPasswordAsync,
     dataDir: DATA_DIR,
   });
 

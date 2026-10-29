@@ -3183,7 +3183,7 @@ describe("api app", () => {
       mustChangePassword?: boolean;
     };
     expect(humanLoginBody.mustChangePassword).toBe(true);
-    const humanCookie = humanLoginRes.headers.get("set-cookie") ?? "";
+    let humanCookie = humanLoginRes.headers.get("set-cookie") ?? "";
 
     const blockedRes = await app.request("http://localhost/api/agents", {
       headers: { cookie: humanCookie },
@@ -3199,6 +3199,7 @@ describe("api app", () => {
       }),
     });
     expect(profileRes.status).toBe(200);
+    humanCookie = profileRes.headers.get("set-cookie") ?? humanCookie;
 
     const allowedRes = await app.request("http://localhost/api/agents", {
       headers: { cookie: humanCookie },
@@ -3268,7 +3269,7 @@ describe("api app", () => {
       }),
     });
     expect(aliceLoginRes.status).toBe(200);
-    const aliceCookie = aliceLoginRes.headers.get("set-cookie") ?? "";
+    let aliceCookie = aliceLoginRes.headers.get("set-cookie") ?? "";
     const profileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: aliceCookie },
@@ -3278,6 +3279,7 @@ describe("api app", () => {
       }),
     });
     expect(profileRes.status).toBe(200);
+    aliceCookie = profileRes.headers.get("set-cookie") ?? aliceCookie;
 
     const channelsRes = await app.request("http://localhost/api/channels", {
       headers: { cookie: aliceCookie },
@@ -3363,7 +3365,7 @@ describe("api app", () => {
       }),
     });
     expect(bobLoginRes.status).toBe(200);
-    const bobCookie = bobLoginRes.headers.get("set-cookie") ?? "";
+    let bobCookie = bobLoginRes.headers.get("set-cookie") ?? "";
     const profileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: bobCookie },
@@ -3373,6 +3375,7 @@ describe("api app", () => {
       }),
     });
     expect(profileRes.status).toBe(200);
+    bobCookie = profileRes.headers.get("set-cookie") ?? bobCookie;
 
     const bobChannelsRes = await app.request("http://localhost/api/channels", {
       headers: { cookie: bobCookie },
@@ -6464,7 +6467,7 @@ describe("api app", () => {
       }),
     });
     expect(bobLoginRes.status).toBe(200);
-    const bobCookie = bobLoginRes.headers.get("set-cookie") ?? "";
+    let bobCookie = bobLoginRes.headers.get("set-cookie") ?? "";
     const bobProfileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: bobCookie },
@@ -6474,6 +6477,7 @@ describe("api app", () => {
       }),
     });
     expect(bobProfileRes.status).toBe(200);
+    bobCookie = bobProfileRes.headers.get("set-cookie") ?? bobCookie;
 
     const createPrivateChannelRes = await app.request("http://localhost/api/channels", {
       method: "POST",
@@ -6552,7 +6556,7 @@ describe("api app", () => {
       }),
     });
     expect(danaLoginRes.status).toBe(200);
-    const danaCookie = danaLoginRes.headers.get("set-cookie") ?? "";
+    let danaCookie = danaLoginRes.headers.get("set-cookie") ?? "";
     const danaProfileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: danaCookie },
@@ -6562,6 +6566,7 @@ describe("api app", () => {
       }),
     });
     expect(danaProfileRes.status).toBe(200);
+    danaCookie = danaProfileRes.headers.get("set-cookie") ?? danaCookie;
 
     const createPrivateChannelRes = await app.request("http://localhost/api/channels", {
       method: "POST",
@@ -6667,7 +6672,7 @@ describe("api app", () => {
       }),
     });
     expect(viewerLoginRes.status).toBe(200);
-    const viewerCookie = viewerLoginRes.headers.get("set-cookie") ?? "";
+    let viewerCookie = viewerLoginRes.headers.get("set-cookie") ?? "";
     const viewerProfileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: viewerCookie },
@@ -6677,6 +6682,7 @@ describe("api app", () => {
       }),
     });
     expect(viewerProfileRes.status).toBe(200);
+    viewerCookie = viewerProfileRes.headers.get("set-cookie") ?? viewerCookie;
 
     const createPrivateChannelRes = await app.request("http://localhost/api/channels", {
       method: "POST",
@@ -6776,7 +6782,7 @@ describe("api app", () => {
       }),
     });
     expect(borisLoginRes.status).toBe(200);
-    const borisCookie = borisLoginRes.headers.get("set-cookie") ?? "";
+    let borisCookie = borisLoginRes.headers.get("set-cookie") ?? "";
     const borisProfileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: borisCookie },
@@ -6786,6 +6792,7 @@ describe("api app", () => {
       }),
     });
     expect(borisProfileRes.status).toBe(200);
+    borisCookie = borisProfileRes.headers.get("set-cookie") ?? borisCookie;
 
     const createChannelRes = await app.request("http://localhost/api/channels", {
       method: "POST",
@@ -6890,7 +6897,7 @@ describe("api app", () => {
       }),
     });
     expect(erinLoginRes.status).toBe(200);
-    const erinCookie = erinLoginRes.headers.get("set-cookie") ?? "";
+    let erinCookie = erinLoginRes.headers.get("set-cookie") ?? "";
     const erinProfileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: erinCookie },
@@ -6900,6 +6907,7 @@ describe("api app", () => {
       }),
     });
     expect(erinProfileRes.status).toBe(200);
+    erinCookie = erinProfileRes.headers.get("set-cookie") ?? erinCookie;
 
     const createTeamRes = await app.request("http://localhost/api/teams", {
       method: "POST",
@@ -7025,7 +7033,7 @@ describe("api app", () => {
       }),
     });
     expect(charlieLoginRes.status).toBe(200);
-    const charlieCookie = charlieLoginRes.headers.get("set-cookie") ?? "";
+    let charlieCookie = charlieLoginRes.headers.get("set-cookie") ?? "";
     const charlieProfileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: charlieCookie },
@@ -7035,6 +7043,7 @@ describe("api app", () => {
       }),
     });
     expect(charlieProfileRes.status).toBe(200);
+    charlieCookie = charlieProfileRes.headers.get("set-cookie") ?? charlieCookie;
 
     const charlieBeforeShareRes = await app.request("http://localhost/api/agents", {
       headers: { cookie: charlieCookie },
@@ -7194,7 +7203,7 @@ describe("api app", () => {
       }),
     });
     expect(frankLoginRes.status).toBe(200);
-    const frankCookie = frankLoginRes.headers.get("set-cookie") ?? "";
+    let frankCookie = frankLoginRes.headers.get("set-cookie") ?? "";
     const frankProfileRes = await app.request("http://localhost/api/auth/profile", {
       method: "PATCH",
       headers: { "content-type": "application/json", cookie: frankCookie },
@@ -7204,6 +7213,7 @@ describe("api app", () => {
       }),
     });
     expect(frankProfileRes.status).toBe(200);
+    frankCookie = frankProfileRes.headers.get("set-cookie") ?? frankCookie;
 
     const createPrivateChannelRes = await app.request("http://localhost/api/channels", {
       method: "POST",
