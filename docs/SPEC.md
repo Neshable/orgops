@@ -258,6 +258,18 @@ Validation is dynamic and composed from:
 
 ## Auth and Access
 
+Instance-level administration uses the existing bootstrap-owner policy: the human
+with the earliest `(created_at,id)` (also used for Google sign-in settings), or a
+global runner credential. Scoped runner credentials are not instance administrators.
+Inviting accounts, resetting temporary passwords, runner bootstrap credentials and
+runner invites, and bulk event deletion require this authority. Channel message
+clearing requires channel management, not merely posting access. Temporary password
+generation uses cryptographic randomness and a reset revokes that human's active
+sessions. Runner bootstrap credentials and runner bootstrap invites are exposed
+only to the bootstrap-owner human; runner credentials, including global runners,
+cannot fetch or mint them. This does not introduce a general role-management API
+or an OS sandbox.
+
 ### Human Auth
 
 - Session-cookie login: `POST /api/auth/login`
@@ -674,8 +686,8 @@ Presence events (bookkeeping only):
 ### Runners
 
 - `GET /api/runners`
-- `GET /api/runners/setup-config` (authenticated human users)
-- `POST /api/runners/invites` (authenticated human users; creates scoped runner bootstrap invite)
+- `GET /api/runners/setup-config` (bootstrap-owner human only)
+- `POST /api/runners/invites` (bootstrap-owner human only; creates scoped runner bootstrap invite)
 - `GET /api/runners/invites/:token` (public invite bootstrap payload for opscli)
 - `POST /api/runners/register` (runner auth; register/re-register)
 - `PATCH /api/runners/:id` (authenticated human users; rename runner display name)

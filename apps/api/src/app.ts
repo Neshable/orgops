@@ -648,6 +648,9 @@ export function createApp(config: AppConfig = {}) {
   });
 
   registerHumansRoutes(app as any, {
+    revokeSessions: (humanId) => {
+      for (const [id, session] of sessions) if (session.id === humanId) sessions.delete(id);
+    },
     orm,
     jsonResponse,
     humanSchema: schema.humans,
@@ -799,6 +802,7 @@ export function createApp(config: AppConfig = {}) {
   });
 
   registerRunnersRoutes(app as any, {
+    access,
     orm,
     bus,
     jsonResponse,
