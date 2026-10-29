@@ -218,7 +218,7 @@ of truth for ordering and policy.
 
 - `events`: append-only event log (`type`, `payload_json`, `source`, `channel_id`, `deliver_at`, `status`, failure counters, idempotency key)
 - `event_payload_blobs`: file-backed storage metadata for oversized event payload JSON spilled out of SQLite
-- `event_receipts`: per-agent delivery state (`PENDING`/`DELIVERED`) used by runner socket wakeups and HTTP catch-up polling
+- `event_receipts`: per-agent delivery state used by runner socket wakeups and HTTP catch-up polling: `PENDING` → `DELIVERED` (claimed by a runner boot, with a lease) → `PROCESSED`; failures return to `PENDING` with backoff until `ORGOPS_RECEIPT_MAX_ATTEMPTS` (default 3), then `DEAD`
 
 ### Memory Summaries
 
@@ -709,7 +709,8 @@ Presence events (bookkeeping only):
 - `PATCH /api/events/:id` (future scheduled `PENDING` events only)
 - `POST /api/events/:id/reveal-sensitive` (human auth + password check; decrypts `message.created.payload.sensitive`)
 - `POST /api/events/:id/ack`
-- `POST /api/events/:id/fail`
+- `POST /api/events/:id/fail` (body `agentName` also fails that agent's receipt: back to `PENDING` with backoff, or `DEAD`)
+- `POST /api/events/receipts/complete` (runner; body `agentName`, `channelId`, `eventIds`: marks this boot's claimed receipts `PROCESSED`)
 - `DELETE /api/events` (filtered or all clear)
 - `DELETE /api/events/:id` (future scheduled `PENDING` events only)
 - `DELETE /api/channels/:channelId/messages`

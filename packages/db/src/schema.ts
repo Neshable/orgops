@@ -65,7 +65,8 @@ export const runnerNodes = sqliteTable("runner_nodes", {
   metadata_json: text("metadata_json").notNull().default("{}"),
   created_at: integer("created_at").notNull(),
   updated_at: integer("updated_at").notNull(),
-  last_seen_at: integer("last_seen_at").notNull()
+  last_seen_at: integer("last_seen_at").notNull(),
+  boot_id: text("boot_id")
 });
 
 
@@ -383,7 +384,13 @@ export const eventReceipts = sqliteTable(
     event_id: text("event_id").notNull(),
     agent_name: text("agent_name").notNull(),
     status: text("status").notNull().default("PENDING"),
-    delivered_at: integer("delivered_at")
+    delivered_at: integer("delivered_at"),
+    claimed_by: text("claimed_by"),
+    claim_expires_at: integer("claim_expires_at"),
+    processed_at: integer("processed_at"),
+    fail_count: integer("fail_count").notNull().default(0),
+    last_error: text("last_error"),
+    retry_at: integer("retry_at")
   },
   (table) => ({
     pk: primaryKey({ columns: [table.event_id, table.agent_name] }),

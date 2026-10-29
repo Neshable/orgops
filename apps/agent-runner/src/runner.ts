@@ -207,6 +207,11 @@ const channelLoopManager = createChannelLoopManager({
     });
     try {
       await handleTurn(agent, channelEvents);
+      await api.completeChannelReceipts(
+        agent.name,
+        channelId,
+        channelEvents.map((event) => event.id),
+      );
     } finally {
       const existing = state.recentTurnWindows.get(key);
       if (!existing) return;
@@ -233,7 +238,7 @@ const channelLoopManager = createChannelLoopManager({
       await api.apiFetch(`/api/events/${event.id}/fail`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ error: String(error) }),
+        body: JSON.stringify({ error: String(error), agentName: agent.name }),
       });
     }
   },

@@ -1,5 +1,6 @@
 import type { Hono } from "hono";
 import { asc, eq } from "drizzle-orm";
+import type { ReceiptClaims } from "../receipt-claims";
 import { randomUUID } from "node:crypto";
 import { schema, type OrgOpsDrizzleDb } from "@orgops/db";
 import type { EventBus } from "@orgops/event-bus";
@@ -25,6 +26,7 @@ type RunnerRecord = {
 type RunnersDeps = {
   access: AccessControl;
   orm: OrgOpsDrizzleDb;
+  receiptClaims?: ReceiptClaims;
   bus: EventBus<any>;
   jsonResponse: (c: any, data: unknown, status?: number) => Response;
   requireAuth: (c: any, next: any) => Response | Promise<Response>;
@@ -66,6 +68,7 @@ function toApiRunner(row: RunnerRecord, onlineThresholdMs: number) {
 
 export function registerRunnersRoutes(app: Hono<any>, deps: RunnersDeps) {
   const { orm, bus, jsonResponse, requireAuth, requireRunnerAuth, runnerToken, runnerApiUrl } = deps;
+  const { receiptClaims } = deps;
   const ONLINE_THRESHOLD_MS = Number(
     process.env.ORGOPS_RUNNER_ONLINE_THRESHOLD_MS ?? 15_000
   );
@@ -225,6 +228,7 @@ export function registerRunnersRoutes(app: Hono<any>, deps: RunnersDeps) {
       body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
         ? (body.metadata as Record<string, unknown>)
         : {};
+    const bootId = typeof body.bootId === "string" ? body.bootId.trim() || null : null;
 
     const existing = orm
       .select()
@@ -243,7 +247,8 @@ export function registerRunnersRoutes(app: Hono<any>, deps: RunnersDeps) {
           version,
           metadata_json: JSON.stringify(metadata),
           updated_at: now,
-          last_seen_at: now
+          last_seen_at: now,
+          ...(bootId ? { boot_id: bootId } : {})
         })
         .where(eq(schema.runnerNodes.id, runnerId))
         .run();
@@ -260,7 +265,8 @@ export function registerRunnersRoutes(app: Hono<any>, deps: RunnersDeps) {
           metadata_json: JSON.stringify(metadata),
           created_at: now,
           updated_at: now,
-          last_seen_at: now
+          last_seen_at: now,
+          boot_id: bootId
         })
         .run();
     }
@@ -273,7 +279,9 @@ export function registerRunnersRoutes(app: Hono<any>, deps: RunnersDeps) {
     if (!row) {
       return jsonResponse(c, { error: "Failed to register runner" }, 500);
     }
-    publishDashboardRefresh("runner.registered", { runnerId });
+    const releasedClaims =
+      bootId && receiptClaims ? receiptClaims.releasePreviousBoots(runnerId, bootId) : 0;
+    publishDashboardRefresh("runner.registered", { runnerId, releasedClaims });
     return jsonResponse(c, { runner: toApiRunner(row, ONLINE_THRESHOLD_MS) }, 201);
   });
 
@@ -351,6 +359,10 @@ export function registerRunnersRoutes(app: Hono<any>, deps: RunnersDeps) {
       })
       .where(eq(schema.runnerNodes.id, runnerId))
       .run();
+    const bootId = c.req.header("x-orgops-runner-boot")?.trim();
+    if (bootId && receiptClaims) {
+      receiptClaims.extend(`${runnerId}:${bootId}`, now);
+    }
     publishDashboardRefresh("runner.heartbeat", { runnerId });
     return jsonResponse(c, { ok: true });
   });

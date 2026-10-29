@@ -25,6 +25,11 @@ import {
   sql,
 } from "drizzle-orm";
 import type { AccessControl, RequestUser } from "./access";
+import {
+  claimOwner,
+  readReceiptMaxAttempts,
+  type ReceiptClaims,
+} from "../receipt-claims";
 
 // Hard ceiling on a single event-listing response, `all=1` included. The events
 // table grows unbounded (~273k rows on staging) and the API is a single thread
@@ -72,6 +77,7 @@ type EventsDeps = {
   access: AccessControl;
   verifyPassword: (password: string, hashed: string) => Promise<boolean>;
   dataDir: string;
+  receiptClaims: ReceiptClaims;
 };
 
 export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
@@ -90,6 +96,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
     access,
     verifyPassword,
     dataDir,
+    receiptClaims,
   } = deps;
   const EventSchema = deps.EventSchema;
   const EVENT_SHAPES_CACHE_TTL_MS = Number(process.env.ORGOPS_EVENT_SHAPES_CACHE_TTL_MS ?? 3000);
@@ -381,7 +388,11 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
   function selectEventRows(
     query: ReturnType<typeof readEventQuery>,
     user: RequestUser | undefined,
-    options: { includeAll: boolean; markRunnerDelivered: boolean },
+    options: {
+      includeAll: boolean;
+      markRunnerDelivered: boolean;
+      claimOwner?: string | null;
+    },
   ): any[] {
     const {
       channelId,
@@ -467,6 +478,9 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
 
     if (agentName) {
       if (isRunnerRequest) {
+        if (options.markRunnerDelivered && !scheduledOnly) {
+          receiptClaims.releaseExpired(now);
+        }
         const receiptClauses: any[] = [
           eq(schema.eventReceipts.agent_name, agentName),
         ];
@@ -482,6 +496,14 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
         }
         if (status) {
           receiptClauses.push(eq(schema.eventReceipts.status, status));
+          if (status === "PENDING") {
+            receiptClauses.push(
+              or(
+                isNull(schema.eventReceipts.retry_at),
+                lte(schema.eventReceipts.retry_at, now),
+              ),
+            );
+          }
         } else if (scheduledOnly && !includeConsumedScheduled) {
           receiptClauses.push(eq(schema.eventReceipts.status, "PENDING"));
         }
@@ -553,7 +575,14 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
           if (pendingDeliveredIds.length > 0) {
             orm
               .update(schema.eventReceipts)
-              .set({ status: "DELIVERED", delivered_at: now })
+              .set({
+                status: "DELIVERED",
+                delivered_at: now,
+                claimed_by: options.claimOwner ?? null,
+                claim_expires_at: options.claimOwner
+                  ? receiptClaims.claimExpiry(now)
+                  : null,
+              })
               .where(
                 and(
                   eq(schema.eventReceipts.agent_name, agentName),
@@ -1364,6 +1393,10 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
     const rows = selectEventRows(query, user, {
       includeAll: false,
       markRunnerDelivered: true,
+      claimOwner: claimOwner(
+        c.req.header("x-orgops-runner-id"),
+        c.req.header("x-orgops-runner-boot"),
+      ),
     });
     const pollingRunner = user?.username === "runner" && Boolean(query.agentName);
     return jsonResponse(c, hydrateEventRows(rows, pollingRunner ? MAX_EVENT_PAGE_PAYLOAD_BYTES : MAX_EVENT_PAYLOAD_BYTES).map(eventRowToApi));
@@ -1535,10 +1568,53 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
     return jsonResponse(c, { ok: true });
   });
 
+  app.post("/api/events/receipts/complete", async (c) => {
+    const user = c.get("user") as RequestUser | undefined;
+    if (user?.username !== "runner") {
+      return jsonResponse(c, { error: "Runner token required" }, 403);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const agentName = typeof body.agentName === "string" ? body.agentName.trim() : "";
+    if (!agentName || !access.canViewAgent(user, agentName)) {
+      return jsonResponse(c, { error: "agentName is required" }, 400);
+    }
+    const now = Date.now();
+    const eventIds = Array.isArray(body.eventIds)
+      ? body.eventIds.filter((id: unknown): id is string => typeof id === "string")
+      : [];
+    let completed = receiptClaims.completeIds({ agentName, eventIds, now });
+    const channelId = typeof body.channelId === "string" ? body.channelId : "";
+    const owner = claimOwner(
+      c.req.header("x-orgops-runner-id"),
+      c.req.header("x-orgops-runner-boot"),
+    );
+    if (channelId && owner) {
+      completed += receiptClaims.completeChannel({ agentName, owner, channelId, now });
+    }
+    return jsonResponse(c, { ok: true, completed });
+  });
+
   app.post("/api/events/:id/fail", async (c) => {
     const id = c.req.param("id");
     const body = await c.req.json().catch(() => ({}));
     const maxFailures = Number(process.env.ORGOPS_EVENT_MAX_FAILURES ?? 25);
+    const user = c.get("user") as RequestUser | undefined;
+    const receiptAgentName =
+      typeof body.agentName === "string" ? body.agentName.trim() : "";
+    // Only a runner that may act for the agent can move its receipt.
+    const canFailReceipt =
+      user?.username === "runner" &&
+      Boolean(receiptAgentName) &&
+      access.canViewAgent(user, receiptAgentName);
+    const receiptStatus = canFailReceipt
+      ? receiptClaims.fail({
+          eventId: id,
+          agentName: receiptAgentName,
+          error: typeof body.error === "string" ? body.error : null,
+          maxAttempts: readReceiptMaxAttempts(),
+          now: Date.now(),
+        })
+      : null;
     const row = orm
       .select({ failCount: schema.events.fail_count })
       .from(schema.events)
@@ -1575,6 +1651,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
       ok: true,
       status: nextStatus,
       failCount: nextCount,
+      ...(receiptStatus ? { receiptStatus } : {}),
     });
   });
 

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { IntentWatchRecord } from "../intent-watchdog";
 
 export function createRunnerState() {
@@ -12,8 +13,12 @@ export function createRunnerState() {
   const intentWatch = new Map<string, IntentWatchRecord>();
   let registeredRunnerId: string | null = null;
   let lastRunnerHeartbeatAt = 0;
+  // Identifies this process. Receipts claimed by an earlier boot of the same
+  // runner are released when this boot registers.
+  const bootId = randomUUID();
 
   return {
+    bootId,
     heartbeats,
     bootstrappedAgents,
     bootstrappedAgentKeys,

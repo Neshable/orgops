@@ -74,6 +74,10 @@ export function createRunnerApi(deps: RunnerApiDeps) {
   async function apiFetch(path: string, init?: RequestInit) {
     const headers = new Headers(init?.headers);
     if (deps.runnerToken) headers.set("x-orgops-runner-token", deps.runnerToken);
+    headers.set("x-orgops-runner-boot", deps.runnerState.bootId);
+    if (deps.runnerState.registeredRunnerId) {
+      headers.set("x-orgops-runner-id", deps.runnerState.registeredRunnerId);
+    }
     const method = init?.method ?? "GET";
     const url = `${deps.apiUrl}${path}`;
     const requestId = `${Date.now()}-${++apiFetchRequestCounter}`;
@@ -124,6 +128,7 @@ export function createRunnerApi(deps: RunnerApiDeps) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         existingRunnerId,
+        bootId: deps.runnerState.bootId,
         displayName,
         hostname: hostname(),
         platform: process.platform,
@@ -179,6 +184,18 @@ export function createRunnerApi(deps: RunnerApiDeps) {
     const res = await apiFetch(`/api/events?${query}`);
     const payload = await res.json();
     return Array.isArray(payload) ? (payload as Event[]) : [];
+  }
+
+  async function completeChannelReceipts(
+    agentName: string,
+    channelId: string,
+    eventIds: string[],
+  ) {
+    await apiFetch("/api/events/receipts/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentName, channelId, eventIds }),
+    });
   }
 
   async function patchAgentState(
@@ -311,6 +328,7 @@ export function createRunnerApi(deps: RunnerApiDeps) {
     sendRunnerHeartbeat,
     listAgents,
     listPendingEventsForAgentChannel,
+    completeChannelReceipts,
     patchAgentState,
     emitEvent,
     listChannels,

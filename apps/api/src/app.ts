@@ -73,6 +73,7 @@ import { registerAgentInviteRoutes } from "./routes/agent-invites";
 import { createAccessControl } from "./routes/access";
 import {hashPasswordAsync,verifyPasswordAsync} from './passwords';
 import {federationFetch} from './federation-transport';
+import { createReceiptClaims } from "./receipt-claims";
 
 export type AppConfig = {
   db?: OrgOpsDb;
@@ -635,6 +636,7 @@ export function createApp(config: AppConfig = {}) {
   }
 
   const access = createAccessControl({ orm });
+  const receiptClaims = createReceiptClaims(db);
 
   registerGoogleAuthRoutes(app as any, {
     db,
@@ -769,6 +771,7 @@ export function createApp(config: AppConfig = {}) {
     access,
     verifyPassword:verifyPasswordAsync,
     dataDir: DATA_DIR,
+    receiptClaims,
   });
 
   registerMemoryRoutes(app as any, { orm, jsonResponse, access });
@@ -822,6 +825,7 @@ export function createApp(config: AppConfig = {}) {
   registerRunnersRoutes(app as any, {
     access,
     orm,
+    receiptClaims,
     bus,
     jsonResponse,
     requireAuth,
