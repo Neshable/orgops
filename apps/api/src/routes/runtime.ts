@@ -51,6 +51,16 @@ export function registerRuntimeRoutes(app: Hono<any>, deps: RuntimeDeps) {
       .from(schema.processes)
       .where(eq(schema.processes.id, processId))
       .get() as { channelId: string | null; agentName: string | null } | undefined;
+  const canViewProcess = (
+    user: RequestUser | undefined,
+    row: { agent_name: string | null; channel_id: string | null },
+  ) => {
+    return Boolean(
+      row.agent_name &&
+        access.canViewAgent(user, row.agent_name) &&
+        (!row.channel_id || access.canViewChannel(user, row.channel_id)),
+    );
+  };
 
   app.post("/api/files", async (c) => {
     const body = await c.req.parseBody();
@@ -163,7 +173,7 @@ export function registerRuntimeRoutes(app: Hono<any>, deps: RuntimeDeps) {
     const statsByProcess = new Map(
       outputStats.map((row) => [row.process_id, row]),
     );
-    const visibleRows = rows.filter((row) => access.canViewAgent(user, row.agent_name));
+    const visibleRows = rows.filter((row) => canViewProcess(user, row));
     const enrichedRows = visibleRows.map((row) => {
       const stats = statsByProcess.get(row.id);
       return {
@@ -434,13 +444,14 @@ export function registerRuntimeRoutes(app: Hono<any>, deps: RuntimeDeps) {
     const processId = c.req.param("id");
     const processRow = orm
       .select({
-        agentName: schema.processes.agent_name,
+        agent_name: schema.processes.agent_name,
+        channel_id: schema.processes.channel_id,
       })
       .from(schema.processes)
       .where(eq(schema.processes.id, processId))
-      .get() as { agentName: string } | undefined;
+      .get() as { agent_name: string | null; channel_id: string | null } | undefined;
     if (!processRow) return jsonResponse(c, { error: "Process not found" }, 404);
-    if (!access.canViewAgent(user, processRow.agentName)) {
+    if (!canViewProcess(user, processRow)) {
       return jsonResponse(c, { error: "Forbidden" }, 403);
     }
     const url = new URL(c.req.url);
