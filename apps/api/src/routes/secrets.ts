@@ -520,25 +520,10 @@ export function registerSecretsRoutes(app: Hono<any>, deps: SecretsDeps) {
       return jsonResponse(c, { error: "Forbidden" }, 403);
     }
 
-    const { env, channelTeamIds, appliedScopeCounts } = resolveAgentSecretsEnv(orm, {
+    const { env } = resolveAgentSecretsEnv(orm, {
       agentName: requestedByAgent,
       channelId,
       masterKey,
-    });
-
-    insertEvent({
-      type: "audit.secret.accessed",
-      channelId,
-      payload: {
-        scopeType: "resolved",
-        count: Object.keys(env).length,
-        names: Object.keys(env).sort(),
-        requestedByAgent,
-        channelTeamIds,
-        appliedScopeCounts,
-      },
-      source: `agent:${requestedByAgent}`,
-      status: "DELIVERED",
     });
     return jsonResponse(c, env);
   });

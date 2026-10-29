@@ -17,6 +17,7 @@
     "@orgops/skills": "file:../../packages/skills",
     "models-dev-db": "^1.0.353",
     "tsx": "^4.20.5",
+    "ws": "^8.18.3",
     "zod": "^3.23.8"
   },
   "devDependencies": {

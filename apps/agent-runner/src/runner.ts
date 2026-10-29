@@ -9,6 +9,10 @@ import { stopAllRlmChildren } from "./rlm-process";
 import { createRunnerState } from "./runner/state";
 import { createRunnerApi } from "./runner/api";
 import {
+  createRunnerSocketClient,
+  type RunnerSocketWakeup,
+} from "./runner/socket";
+import {
   clearAgentIntentWatch,
   collectDueIntentTimeouts,
   ingestIntentEvents,
@@ -55,6 +59,7 @@ const DEFAULT_LLM_CALL_TIMEOUT_MS = 10_800_000;
 const DEFAULT_AGENT_INTENT_TIMEOUT_MS = 45_000;
 const DEFAULT_AGENT_INTENT_MAX_TIMEOUTS = 3;
 const DEFAULT_WORKSPACE_PUBLICATION_SYNC_INTERVAL_MS = 2000;
+const DEFAULT_RUNNER_POLL_FALLBACK_INTERVAL_MS = 15_000;
 
 function readPositiveIntEnv(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
@@ -93,6 +98,10 @@ const WORKSPACE_PUBLICATION_SYNC_INTERVAL_MS = readPositiveIntEnv(
   process.env.ORGOPS_WORKSPACE_PUBLICATION_SYNC_INTERVAL_MS,
   DEFAULT_WORKSPACE_PUBLICATION_SYNC_INTERVAL_MS,
 );
+const RUNNER_POLL_FALLBACK_INTERVAL_MS = readPositiveIntEnv(
+  process.env.ORGOPS_RUNNER_POLL_FALLBACK_INTERVAL_MS,
+  DEFAULT_RUNNER_POLL_FALLBACK_INTERVAL_MS,
+);
 
 const state = createRunnerState();
 const api = createRunnerApi({
@@ -101,6 +110,50 @@ const api = createRunnerApi({
   heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
   runnerIdFile: RUNNER_ID_FILE,
   runnerState: state,
+});
+const cachedAgents = new Map<string, Agent>();
+const pendingSocketWakeups = new Map<string, Set<string>>();
+let fullPollRequested = true;
+let wakeResolver: (() => void) | null = null;
+
+function wakeRunnerLoop() {
+  const resolve = wakeResolver;
+  wakeResolver = null;
+  resolve?.();
+}
+
+function enqueueSocketWakeups(events: RunnerSocketWakeup[]) {
+  for (const event of events) {
+    if (!event.channelId) {
+      fullPollRequested = true;
+      continue;
+    }
+    const channels = pendingSocketWakeups.get(event.agentName) ?? new Set<string>();
+    channels.add(event.channelId);
+    pendingSocketWakeups.set(event.agentName, channels);
+  }
+  wakeRunnerLoop();
+}
+
+function waitForRunnerWakeup(timeoutMs: number) {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      if (wakeResolver === resolveWakeup) wakeResolver = null;
+      resolve();
+    }, timeoutMs);
+    const resolveWakeup = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    wakeResolver = resolveWakeup;
+  });
+}
+
+const runnerSocket = createRunnerSocketClient({
+  apiUrl: API_URL,
+  runnerToken: process.env.ORGOPS_RUNNER_TOKEN ?? "dev-runner-token",
+  getRunnerId: () => state.registeredRunnerId,
+  onWakeup: enqueueSocketWakeups,
 });
 const handleTurn = createTurnExecutor({
   projectRoot: PROJECT_ROOT,
@@ -194,7 +247,10 @@ async function ensureWorkspace(agent: Agent) {
   agent.workspacePath = workspacePath;
 }
 
-async function pollAgent(agent: Agent) {
+async function pollAgent(
+  agent: Agent,
+  options: { onlyChannelIds?: Set<string> } = {},
+) {
   if (
     state.registeredRunnerId &&
     agent.assignedRunnerId &&
@@ -284,7 +340,8 @@ async function pollAgent(agent: Agent) {
       ),
     )
     .map((channel) => channel.id)
-    .filter((channelId): channelId is string => Boolean(channelId));
+    .filter((channelId): channelId is string => Boolean(channelId))
+    .filter((channelId) => !options.onlyChannelIds || options.onlyChannelIds.has(channelId));
   const pendingBuckets = await Promise.all(
     subscribedChannelIds.map(async (channelId) => {
       if (channelLoopManager.isChannelBusy(agent.name, channelId)) {
@@ -353,6 +410,19 @@ async function pollAgent(agent: Agent) {
   }
 }
 
+async function processSocketWakeups() {
+  const wakeups = [...pendingSocketWakeups.entries()];
+  pendingSocketWakeups.clear();
+  for (const [agentName, channelIds] of wakeups) {
+    const agent = cachedAgents.get(agentName);
+    if (!agent) {
+      fullPollRequested = true;
+      continue;
+    }
+    await pollAgent(agent, { onlyChannelIds: channelIds });
+  }
+}
+
 async function reconcileRemovedAgents(activeAgents: Agent[]) {
   const activeNames = new Set(activeAgents.map((agent) => agent.name));
   for (const agentName of [...state.bootstrappedAgents]) {
@@ -406,25 +476,41 @@ export async function loop() {
     }
   }
 
+  runnerSocket.start();
+  let nextFallbackPollAt = 0;
+
   while (!shuttingDown) {
     try {
       await api.sendRunnerHeartbeat();
-      const agents = await api.listAgents();
-      await reconcileRemovedAgents(agents);
-      const results = await Promise.allSettled(agents.map(async (agent) => pollAgent(agent)));
-      for (const result of results) {
-        if (result.status === "rejected") {
-          console.error("runner.poll_agent_failed", summarizeError(result.reason));
+      const now = Date.now();
+      if (fullPollRequested || now >= nextFallbackPollAt) {
+        fullPollRequested = false;
+        nextFallbackPollAt = now + RUNNER_POLL_FALLBACK_INTERVAL_MS;
+        const agents = await api.listAgents();
+        cachedAgents.clear();
+        for (const agent of agents) cachedAgents.set(agent.name, agent);
+        await reconcileRemovedAgents(agents);
+        const results = await Promise.allSettled(agents.map(async (agent) => pollAgent(agent)));
+        for (const result of results) {
+          if (result.status === "rejected") {
+            console.error("runner.poll_agent_failed", summarizeError(result.reason));
+          }
         }
       }
-      await workspacePublicationSync.sync(agents);
+      await processSocketWakeups();
+      if (cachedAgents.size > 0) {
+        await workspacePublicationSync.sync([...cachedAgents.values()]);
+      }
     } catch (error) {
       console.error("runner.loop_iteration_failed", summarizeError(error));
     }
     if (shuttingDown) break;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (!fullPollRequested && pendingSocketWakeups.size === 0) {
+      await waitForRunnerWakeup(1000);
+    }
   }
 
+  runnerSocket.stop();
   process.off("SIGINT", onSigint);
   process.off("SIGTERM", onSigterm);
   await maintenanceLoop.awaitInFlight();
