@@ -128,6 +128,8 @@ describe("realtime voice manager", () => {
     const shellRun = update.session.tools.find((tool: any) => tool.name === "shell_run");
     expect(shellRun).toMatchObject({ type: "function", parameters: { type: "object" } });
     expect(shellRun.parameters.required).toContain("cmd");
+    expect(update.session.tools.map((tool: any) => tool.name)).not.toContain("events_schedule_self");
+    expect(update.session.tools.map((tool: any) => tool.name)).not.toContain("events_scheduled_create");
     expect(ctx.manager.hasActiveCall("voice-agent", "chan-1")).toBe(true);
   });
 

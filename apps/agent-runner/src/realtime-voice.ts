@@ -482,8 +482,17 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
       apiFetch: deps.api.apiFetch,
       emitEvent: deps.api.emitEvent,
     });
+    const realtimeToolEntries = Object.entries(toolsByName).filter(
+      ([name]) =>
+        ![
+          "events_scheduled_create",
+          "events_scheduled_update",
+          "events_scheduled_delete",
+          "events_schedule_self",
+        ].includes(name),
+    );
     const tools = await Promise.all(
-      Object.entries(toolsByName).map(async ([name, tool]) => ({
+      realtimeToolEntries.map(async ([name, tool]) => ({
         type: "function",
         name,
         description: tool.description ?? "",
