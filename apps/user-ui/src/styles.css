@@ -2364,26 +2364,72 @@ button {
 .composer-voice-actions {
   display: grid;
   gap: 8px;
+  min-width: 0;
 }
 
-.composer-voice-disclosure {
+.composer-action-menu {
+  position: relative;
   display: grid;
-  gap: 8px;
+  justify-items: end;
+  min-width: 0;
 }
 
-.composer .composer-voice-toggle {
-  display: inline-flex;
+.composer .composer-action-menu-button {
+  display: inline-grid;
   align-items: center;
   justify-content: center;
+  justify-self: end;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-color: #99f6e4 !important;
+  border-radius: 14px;
+  color: #0f766e !important;
+  line-height: 1;
+}
+
+.composer .composer-action-menu-button:hover,
+.composer .composer-action-menu-button[aria-expanded="true"] {
+  background: #f0fdfa !important;
+  border-color: #5eead4 !important;
+}
+
+.composer-action-menu-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.composer-action-menu-items {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  display: grid;
   gap: 8px;
+  width: min(280px, calc(100vw - 32px));
+  padding: 8px;
+  border: 1px solid #dbe6ef;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.18);
 }
 
-.composer-voice-toggle svg {
-  transition: transform 0.16s ease;
+.composer-action-menu-items::after {
+  content: "";
+  position: absolute;
+  right: 22px;
+  bottom: -6px;
+  width: 12px;
+  height: 12px;
+  border-right: 1px solid #dbe6ef;
+  border-bottom: 1px solid #dbe6ef;
+  background: rgba(255, 255, 255, 0.98);
+  transform: rotate(45deg);
 }
 
-.composer-voice-disclosure.is-expanded .composer-voice-toggle svg {
-  transform: rotate(180deg);
+.composer-action-menu-items > * {
+  position: relative;
+  z-index: 1;
 }
 
 .composer button {
@@ -2430,6 +2476,7 @@ button {
 .composer-voice {
   display: inline-grid;
   place-items: center;
+  min-width: 0;
   white-space: nowrap;
 }
 
@@ -3397,7 +3444,7 @@ button {
   }
 
   .composer-actions {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: 1fr;
   }
 
   .composer button {
