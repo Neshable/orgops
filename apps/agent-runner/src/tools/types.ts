@@ -26,6 +26,16 @@ export type ExecuteContext = {
   apiFetch: (path: string, init?: RequestInit) => Promise<Response>;
   emitEvent: (event: unknown) => Promise<void>;
   emitAudit: (type: string, payload: unknown, source?: string) => Promise<void>;
+  // CLASSIC turns can stage unscheduled chat output until final response validation succeeds.
+  deferMessage?: (event: {
+    type: string;
+    payload: unknown;
+    source: string;
+    channelId?: string;
+    parentEventId?: string;
+    deliverAt?: number;
+    idempotencyKey?: string;
+  }) => void;
   validateEvent?: (event: {
     type: string;
     payload: unknown;

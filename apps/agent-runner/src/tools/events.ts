@@ -31,6 +31,7 @@ const emitSchema = z.object({
   channelId: z.string().min(1).optional(),
   parentEventId: z.string().min(1).optional(),
   idempotencyKey: z.string().min(1).optional(),
+  stageUntilTurnSettled: z.boolean().optional(),
   awaitDeliveryMs: z.number().int().min(1).max(120_000).optional(),
 }).merge(scheduleOptionsSchema);
 
@@ -264,7 +265,7 @@ const scheduleSelfSchema = z
 export const eventsToolDefs: ToolDef[] = [
   [
     "events_emit",
-    "Emit a custom event by type to a channel (or current channel). Optional scheduling via deliverAt, deliverAtIso, delayMs, or delaySeconds. Optional awaitDeliveryMs to wait until status leaves PENDING.",
+    "Emit a custom event by type to a channel (or current channel). Optional scheduling via deliverAt, deliverAtIso, delayMs, or delaySeconds. Optional awaitDeliveryMs to wait until status leaves PENDING. Set stageUntilTurnSettled=true to stage unscheduled message.created until the turn outcome is known, so retries can discard interim drafts.",
     emitSchema,
   ],
   [
@@ -1207,6 +1208,20 @@ export async function execute(
       validateEventOrThrow(ctx, eventDraft);
     } catch (error) {
       return { error: String(error) };
+    }
+    if (
+      eventDraft.type === "message.created" &&
+      deliverAt === undefined &&
+      parsed.stageUntilTurnSettled === true &&
+      ctx.deferMessage
+    ) {
+      ctx.deferMessage(eventDraft);
+      return {
+        event: eventDraft,
+        channelId: targetChannelId,
+        delivery: { status: "staged_until_turn_settled" },
+        note: "Message staged for this attempt; retries discard it. No event is persisted yet, so awaitDeliveryMs cannot resolve until the turn settles.",
+      };
     }
     const response = await ctx.apiFetch("/api/events", {
       method: "POST",
