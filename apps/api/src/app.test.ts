@@ -7651,6 +7651,12 @@ describe("api app", () => {
     });
     expect(loginRes.status).toBe(200);
     const cookie = loginRes.headers.get("set-cookie") ?? "";
+    const meRes = await app.request("http://localhost/api/auth/me", {
+      headers: { cookie },
+    });
+    expect(meRes.status).toBe(200);
+    const me = (await meRes.json()) as { id?: string | null };
+    expect(typeof me.id).toBe("string");
 
     const createInviteRes = await app.request("http://orgops.exe.xyz/api/agent-invites", {
       method: "POST",
@@ -7672,6 +7678,7 @@ describe("api app", () => {
       allowChannelExpansion?: boolean;
       createdByType?: string;
       createdById?: string;
+      ownerHumanId?: string | null;
     };
     expect(invite.agentName).toBe("claude-bridge");
     expect(invite.channelIds).toEqual([]);
@@ -7680,6 +7687,7 @@ describe("api app", () => {
     expect(invite.allowChannelExpansion).toBe(true);
     expect(invite.createdByType).toBe("HUMAN");
     expect(invite.createdById).toBe("admin");
+    expect(invite.ownerHumanId).toBe(me.id);
     expect(typeof invite.inviteLink).toBe("string");
     expect(invite.inviteLink?.startsWith("http://orgops.exe.xyz/api/agent-invites/public/")).toBe(true);
 
@@ -7743,6 +7751,33 @@ describe("api app", () => {
     expect(redeemed.agent.name).toBe("claude-bridge");
     expect(redeemed.agent.visibility).toBe("PRIVATE");
     expect(redeemed.agent.assignedRunnerId).toBe(redeemed.runner.runnerId);
+
+    const scopedPatchConfigRes = await app.request("http://localhost/api/agents/claude-bridge", {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        "x-orgops-runner-token": redeemed.runner.token,
+      },
+      body: JSON.stringify({
+        wrappedConfig: {
+          kind: "x-bot",
+          runtime: { command: "node ./x-bot.js" },
+        },
+      }),
+    });
+    expect(scopedPatchConfigRes.status).toBe(200);
+
+    const privateAgentRes = await app.request("http://localhost/api/agents/claude-bridge", {
+      headers: { cookie },
+    });
+    expect(privateAgentRes.status).toBe(200);
+    const privateAgent = (await privateAgentRes.json()) as {
+      ownerHumanId?: string | null;
+      wrappedConfig?: { kind?: string; runtime?: { command?: string } };
+    };
+    expect(privateAgent.ownerHumanId).toBe(me.id);
+    expect(privateAgent.wrappedConfig?.kind).toBe("x-bot");
+    expect(privateAgent.wrappedConfig?.runtime?.command).toBe("node ./x-bot.js");
 
     const agentCreatedInviteRes = await app.request("http://localhost/api/agent-invites", {
       method: "POST",

@@ -3073,10 +3073,14 @@ describe("agent runner", () => {
     const started = (await executeTool(ctx, "shell_start", {
       cmd: "sleep 0.1",
     })) as { processId: string };
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    const status = (await executeTool(ctx, "shell_status", {
-      processId: started.processId,
-    })) as { running: boolean };
+    let status = { running: true };
+    const deadline = Date.now() + 3000;
+    while (status.running && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      status = (await executeTool(ctx, "shell_status", {
+        processId: started.processId,
+      })) as { running: boolean };
+    }
     expect(status.running).toBe(false);
   });
 });
