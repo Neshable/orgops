@@ -1113,3 +1113,22 @@ and explicit SQLite export remain available. Invalid/negative page limits fall
 back to 100 rather than uncapping SQL reads. Successful void tool results remain
 successful while persisted output is bounded. This forwards the deployed #78
 recovery protections onto the current voice/blob-storage implementation.
+
+### Production HTTP resource boundaries
+
+All `/api/*` requests have production body limits, including streams without a
+Content-Length: 1 MiB for ordinary API calls, 21 MiB for multipart uploads (retains
+the runner's 20 MiB file capacity), and 16 MiB for agent copy/move/transfer routes.
+Operators can set positive integer byte limits with `ORGOPS_API_MAX_BODY_BYTES`,
+`ORGOPS_UPLOAD_MAX_BODY_BYTES` and `ORGOPS_TRANSFER_MAX_BODY_BYTES`. Authentication
+retains its stricter 4 KiB limit. Oversized requests return JSON 413 before route
+parsing or database writes. Large existing clients may need explicit adjustment.
+
+API responses include nosniff, no-referrer, same-origin framing, a restrictive
+API CSP, disabled browser camera/microphone/geolocation permissions, and private
+no-store caching. These apply to API errors too. Existing download policies remain
+more restrictive. Product HTML/publication routes and a separately hosted SPA
+must configure their own compatible policy at their deployment boundary; see
+`docs/DEPLOYMENT_SECURITY.md`. An API middleware cannot fix a host nginx rule that
+routes `/health` to the SPA, and shipping a controller source file does not install
+it on a host.
