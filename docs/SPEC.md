@@ -968,6 +968,7 @@ Security note: wrapped `source`, `setup.command`, and `runtime.command` are host
 - `ORGOPS_WORKSPACE_PUBLICATION_SYNC_INTERVAL_MS`
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, `LIQUID_API_KEY`
   - for native/wrapped runtime execution with injected env, provider keys are loaded from resolved secrets and do not fall back to host process env
+  - realtime voice runtimes and realtime-model memory maintenance use resolved secrets first, then fall back to runner/API process env provider keys
   - when the default `system` agent is seeded, the matching key is copied into a public secret so the runner can inject it
 - `OPENROUTER_BASE_URL`, `OPENROUTER_HTTP_REFERER`, `OPENROUTER_APP_TITLE`
 - `LIQUID_BASE_URL` (optional; defaults to `https://labs.liquid.ai/api/v1`; store with `LIQUID_API_KEY` as OrgOps secrets)
