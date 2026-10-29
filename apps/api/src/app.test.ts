@@ -5207,14 +5207,15 @@ describe("api app", () => {
     expect(loginRes.status).toBe(200);
     const cookie = loginRes.headers.get("set-cookie") ?? "";
 
+    const legacyPayloadJson = JSON.stringify({ blob: "n".repeat(300_000) });
     db.prepare(
       "INSERT INTO events (id, type, payload_json, source, channel_id, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
     ).run(
       "huge-1",
       "tool.executed",
-      JSON.stringify({ blob: "n".repeat(300_000) }),
+      legacyPayloadJson,
       "agent:tester",
-      "chan-1",
+      null,
       1,
       "DELIVERED",
     );
@@ -5231,6 +5232,79 @@ describe("api app", () => {
     expect(list[0]?.id).toBe("huge-1");
     expect(list[0]?.payloadTruncated).toBe(true);
     expect(list[0]?.payload?.truncated).toBe(true);
+
+    const chunkRes = await app.request(
+      "http://localhost/api/events/huge-1/payload?offset=10&limit=25",
+      { headers: { cookie } },
+    );
+    expect(chunkRes.status).toBe(200);
+    const chunk = (await chunkRes.json()) as {
+      storage?: string;
+      totalChars?: number;
+      offset?: number;
+      chunk?: string;
+      nextOffset?: number;
+      done?: boolean;
+    };
+    expect(chunk.storage).toBe("db");
+    expect(chunk.totalChars).toBe(legacyPayloadJson.length);
+    expect(chunk.offset).toBe(10);
+    expect(chunk.chunk).toBe(legacyPayloadJson.slice(10, 35));
+    expect(chunk.nextOffset).toBe(35);
+    expect(chunk.done).toBe(false);
+
+    const postedPayload = { tool: "probe", output: "x".repeat(300_000) };
+    const postRes = await app.request("http://localhost/api/events", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({
+        type: "tool.executed",
+        source: "agent:tester",
+        payload: postedPayload,
+      }),
+    });
+    expect(postRes.status).toBe(201);
+    const posted = (await postRes.json()) as {
+      id: string;
+      payloadTruncated?: boolean;
+      payloadRef?: { storage?: string; totalChars?: number; sha256?: string };
+    };
+    expect(posted.payloadTruncated).toBe(true);
+    expect(posted.payloadRef?.storage).toBe("file");
+
+    const storedEvent = db
+      .prepare("SELECT payload_json FROM events WHERE id = ?")
+      .get(posted.id) as { payload_json: string };
+    expect(storedEvent.payload_json.length).toBeLessThan(1_000);
+    const blob = db
+      .prepare("SELECT storage_path, char_length, byte_length, sha256 FROM event_payload_blobs WHERE event_id = ?")
+      .get(posted.id) as {
+        storage_path: string;
+        char_length: number;
+        byte_length: number;
+        sha256: string;
+      };
+    const postedPayloadJson = JSON.stringify(postedPayload);
+    expect(blob.char_length).toBe(postedPayloadJson.length);
+    expect(blob.byte_length).toBe(Buffer.byteLength(postedPayloadJson, "utf8"));
+    expect(blob.sha256).toBe(createHash("sha256").update(postedPayloadJson).digest("hex"));
+    expect(existsSync(join(dataDir, blob.storage_path))).toBe(true);
+
+    const fileChunkRes = await app.request(
+      `http://localhost/api/events/${encodeURIComponent(posted.id)}/payload?offset=20&limit=30`,
+      { headers: { cookie } },
+    );
+    expect(fileChunkRes.status).toBe(200);
+    const fileChunk = (await fileChunkRes.json()) as {
+      storage?: string;
+      totalChars?: number;
+      chunk?: string;
+      sha256?: string;
+    };
+    expect(fileChunk.storage).toBe("file");
+    expect(fileChunk.totalChars).toBe(postedPayloadJson.length);
+    expect(fileChunk.chunk).toBe(postedPayloadJson.slice(20, 50));
+    expect(fileChunk.sha256).toBe(blob.sha256);
 
     rmSync(dataDir, { recursive: true, force: true });
   });

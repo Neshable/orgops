@@ -4,10 +4,11 @@ import {
 } from "./routes/google-auth";
 import { Hono } from "hono";
 import { createNodeWebSocket } from "@hono/node-ws";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  createHash,
   randomBytes,
   randomUUID,
   scryptSync,
@@ -134,10 +135,12 @@ export function createApp(config: AppConfig = {}) {
     `http://localhost:${process.env.PORT ?? "8787"}`;
 
   const FILES_DIR = join(PROJECT_ROOT, "files");
+  const EVENT_PAYLOAD_BLOBS_DIR = join(DATA_DIR, "event-payloads");
   const SKILL_ROOTS = resolveSkillRoots(PROJECT_ROOT);
   let lastEventCreatedAt = 0;
 
   mkdirSync(FILES_DIR, { recursive: true });
+  mkdirSync(EVENT_PAYLOAD_BLOBS_DIR, { recursive: true });
 
   function hashPassword(password: string) {
     const salt = randomBytes(16).toString("hex");
@@ -301,21 +304,41 @@ export function createApp(config: AppConfig = {}) {
 
   const MAX_EVENT_PAYLOAD_JSON_CHARS = 262_144;
 
-  function parseEventPayload(payloadJson: unknown): {
+  function eventPayloadBlobRef(row: any) {
+    const storagePath = typeof row.payload_blob_storage_path === "string"
+      ? row.payload_blob_storage_path
+      : "";
+    if (!storagePath) return undefined;
+    return {
+      storage: "file",
+      eventId: row.id,
+      totalChars: row.payload_json_chars,
+      byteLength: row.payload_blob_byte_length,
+      sha256: row.payload_blob_sha256,
+    };
+  }
+
+  function parseEventPayload(payloadJson: unknown, payloadJsonChars?: unknown): {
     payload: unknown;
     payloadTruncated: boolean;
   } {
-    if (typeof payloadJson !== "string") {
-      return { payload: {}, payloadTruncated: false };
-    }
-    if (payloadJson.length > MAX_EVENT_PAYLOAD_JSON_CHARS) {
+    const originalLength =
+      typeof payloadJsonChars === "number" && Number.isFinite(payloadJsonChars)
+        ? payloadJsonChars
+        : typeof payloadJson === "string"
+          ? payloadJson.length
+          : null;
+    if (originalLength !== null && originalLength > MAX_EVENT_PAYLOAD_JSON_CHARS) {
       return {
         payload: {
           truncated: true,
-          omittedChars: payloadJson.length - MAX_EVENT_PAYLOAD_JSON_CHARS,
+          omittedChars: originalLength - MAX_EVENT_PAYLOAD_JSON_CHARS,
         },
         payloadTruncated: true,
       };
+    }
+    if (typeof payloadJson !== "string") {
+      return { payload: {}, payloadTruncated: false };
     }
     return { payload: parseJson(payloadJson, {}), payloadTruncated: false };
   }
@@ -339,7 +362,11 @@ export function createApp(config: AppConfig = {}) {
   }
 
   function eventRowToApi(row: any) {
-    const { payload, payloadTruncated } = parseEventPayload(row.payload_json);
+    const { payload, payloadTruncated } = parseEventPayload(
+      row.payload_json,
+      row.payload_json_chars,
+    );
+    const payloadRef = payloadTruncated ? eventPayloadBlobRef(row) : undefined;
     return {
       id: row.id,
       type: row.type,
@@ -354,6 +381,7 @@ export function createApp(config: AppConfig = {}) {
       idempotencyKey: row.idempotency_key ?? undefined,
       createdAt: row.created_at,
       ...(payloadTruncated ? { payloadTruncated: true } : {}),
+      ...(payloadRef ? { payloadRef } : {}),
     };
   }
 
@@ -488,7 +516,31 @@ export function createApp(config: AppConfig = {}) {
     const createdAt = Math.max(now, lastEventCreatedAt + 1);
     lastEventCreatedAt = createdAt;
     const id = input.id ?? randomUUID();
-    const payloadJson = JSON.stringify(input.payload ?? {});
+    const rawPayloadJson = JSON.stringify(input.payload ?? {});
+    const payloadBytes = Buffer.from(rawPayloadJson, "utf8");
+    const shouldSpillPayload = rawPayloadJson.length > MAX_EVENT_PAYLOAD_JSON_CHARS;
+    const payloadSha256 = createHash("sha256").update(payloadBytes).digest("hex");
+    const blobFileName = `${createHash("sha256").update(id).digest("hex")}.json`;
+    const blobStoragePath = join("event-payloads", blobFileName);
+    const blobAbsolutePath = join(DATA_DIR, blobStoragePath);
+    const blobTempPath = `${blobAbsolutePath}.${process.pid}.${Date.now()}.tmp`;
+    if (shouldSpillPayload) {
+      writeFileSync(blobTempPath, payloadBytes);
+      renameSync(blobTempPath, blobAbsolutePath);
+    }
+    const payloadJson = shouldSpillPayload
+      ? JSON.stringify({
+          truncated: true,
+          omittedChars: rawPayloadJson.length - MAX_EVENT_PAYLOAD_JSON_CHARS,
+          payloadRef: {
+            storage: "file",
+            eventId: id,
+            totalChars: rawPayloadJson.length,
+            byteLength: payloadBytes.length,
+            sha256: payloadSha256,
+          },
+        })
+      : rawPayloadJson;
     const row = {
       id,
       type: input.type,
@@ -502,41 +554,66 @@ export function createApp(config: AppConfig = {}) {
       last_error: null,
       idempotency_key: input.idempotencyKey ?? null,
       created_at: createdAt,
+      payload_json_chars: rawPayloadJson.length,
+      payload_blob_storage_path: shouldSpillPayload ? blobStoragePath : null,
+      payload_blob_byte_length: shouldSpillPayload ? payloadBytes.length : null,
+      payload_blob_sha256: shouldSpillPayload ? payloadSha256 : null,
     };
     const recipientAgents = resolveRecipientAgents();
     if (recipientAgents.length > 0 && input.status === undefined) {
       row.status = "PENDING";
     }
-    orm
-      .insert(schema.events)
-      .values({
-        id: row.id,
-        type: row.type,
-        payload_json: row.payload_json,
-        source: row.source,
-        channel_id: row.channel_id,
-        parent_event_id: row.parent_event_id,
-        deliver_at: row.deliver_at,
-        status: row.status,
-        fail_count: row.fail_count,
-        last_error: row.last_error,
-        idempotency_key: row.idempotency_key,
-        created_at: row.created_at,
-      })
-      .run();
-    if (recipientAgents.length > 0) {
-      orm
-        .insert(schema.eventReceipts)
-        .values(
-          recipientAgents.map((agentName) => ({
-            event_id: row.id,
-            agent_name: agentName,
-            status: row.status === "DELIVERED" ? "DELIVERED" : "PENDING",
-            delivered_at: row.status === "DELIVERED" ? row.created_at : null,
-          })),
-        )
-        .onConflictDoNothing()
-        .run();
+    try {
+      const writeRows = db.transaction(() => {
+        orm
+          .insert(schema.events)
+          .values({
+            id: row.id,
+            type: row.type,
+            payload_json: row.payload_json,
+            source: row.source,
+            channel_id: row.channel_id,
+            parent_event_id: row.parent_event_id,
+            deliver_at: row.deliver_at,
+            status: row.status,
+            fail_count: row.fail_count,
+            last_error: row.last_error,
+            idempotency_key: row.idempotency_key,
+            created_at: row.created_at,
+          })
+          .run();
+        if (shouldSpillPayload) {
+          orm
+            .insert(schema.eventPayloadBlobs)
+            .values({
+              event_id: row.id,
+              storage_path: blobStoragePath,
+              char_length: rawPayloadJson.length,
+              byte_length: payloadBytes.length,
+              sha256: payloadSha256,
+              created_at: row.created_at,
+            })
+            .run();
+        }
+        if (recipientAgents.length > 0) {
+          orm
+            .insert(schema.eventReceipts)
+            .values(
+              recipientAgents.map((agentName) => ({
+                event_id: row.id,
+                agent_name: agentName,
+                status: row.status === "DELIVERED" ? "DELIVERED" : "PENDING",
+                delivered_at: row.status === "DELIVERED" ? row.created_at : null,
+              })),
+            )
+            .onConflictDoNothing()
+            .run();
+        }
+      });
+      writeRows();
+    } catch (error) {
+      if (shouldSpillPayload) rmSync(blobAbsolutePath, { force: true });
+      throw error;
     }
     publishEvent(row);
     void pushFederatedEvent(row);
@@ -674,6 +751,7 @@ export function createApp(config: AppConfig = {}) {
     serializeEventShapes,
     access,
     verifyPassword,
+    dataDir: DATA_DIR,
   });
 
   registerMemoryRoutes(app as any, { orm, jsonResponse, access });

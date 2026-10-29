@@ -1,6 +1,9 @@
 import { z } from "zod";
+import { dirname } from "node:path";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { getReservedEventTypeError } from "../event-type-guard";
 import { compactListedEvent } from "../prompt-event-compact";
+import { resolveAgentPath } from "./path-access";
 import type { ExecuteContext, ToolDef } from "./types";
 
 const EVENT_SEARCH_DEFAULT_LIMIT = 50;
@@ -52,6 +55,14 @@ const searchSchema = z.object({
   order: z.enum(["asc", "desc"]).optional(),
   scheduled: z.boolean().optional(),
   all: z.boolean().optional(),
+});
+
+const payloadReadSchema = z.object({
+  eventId: z.string().min(1),
+  offset: z.number().int().min(0).optional(),
+  limit: z.number().int().min(1).max(262_144).optional(),
+  saveToWorkspacePath: z.string().min(1).optional(),
+  maxBytes: z.number().int().min(1).max(50 * 1024 * 1024).optional(),
 });
 
 const scheduledListSchema = z.object({
@@ -265,6 +276,11 @@ export const eventsToolDefs: ToolDef[] = [
     "events_search",
     "Search events across visible channels with optional filters (type/source/status/after/before/order). Defaults to 50 events, excludes bookkeeping types (tool/telemetry/audit/process/wrapper/turn), and returns compacted payloads. Pass type or typePrefix to include a bookkeeping family. `all` no longer uncaps the result set; page with after/before/limit instead.",
     searchSchema,
+  ],
+  [
+    "events_payload_read",
+    "Read a large event payload deliberately. Returns a bounded chunk by default. Provide saveToWorkspacePath to page the payload into an agent workspace file for inspection with fs/shell tools.",
+    payloadReadSchema,
   ],
   [
     "events_scheduled_list",
@@ -605,6 +621,44 @@ function requestsBookkeepingEvents(parsed: { type?: string; typePrefix?: string 
   );
 }
 
+type PayloadChunkResponse = {
+  eventId: string;
+  storage: string;
+  totalChars: number;
+  byteLength?: number;
+  offset: number;
+  limit: number;
+  chunk: string;
+  nextOffset: number;
+  done: boolean;
+  sha256?: string;
+};
+
+async function readPayloadChunk(
+  ctx: ExecuteContext,
+  input: { eventId: string; offset: number; limit: number },
+): Promise<PayloadChunkResponse> {
+  const query = new URLSearchParams();
+  query.set("offset", String(input.offset));
+  query.set("limit", String(input.limit));
+  const response = await ctx.apiFetch(
+    `/api/events/${encodeURIComponent(input.eventId)}/payload?${query.toString()}`,
+  );
+  if (!response.ok) {
+    return {
+      eventId: input.eventId,
+      storage: "error",
+      totalChars: 0,
+      offset: input.offset,
+      limit: input.limit,
+      chunk: await response.text(),
+      nextOffset: input.offset,
+      done: true,
+    };
+  }
+  return (await response.json()) as PayloadChunkResponse;
+}
+
 export async function execute(
   ctx: ExecuteContext,
   tool: string,
@@ -666,6 +720,64 @@ export async function execute(
     const events = (await response.json()) as unknown[];
     const compacted = Array.isArray(events) ? events.map(compactListedEvent) : [];
     return { filters: parsed, events: compacted };
+  }
+
+  if (tool === "events_payload_read") {
+    const parsedResult = parseToolArgs(tool, payloadReadSchema, args);
+    if (!parsedResult.ok) return { error: parsedResult.error };
+    const parsed = parsedResult.data;
+    const chunkSize = parsed.limit ?? 65_536;
+    const startOffset = parsed.offset ?? 0;
+    if (!parsed.saveToWorkspacePath) {
+      return readPayloadChunk(ctx, {
+        eventId: parsed.eventId,
+        offset: startOffset,
+        limit: chunkSize,
+      });
+    }
+
+    const outputPath = resolveAgentPath(
+      ctx.agent,
+      parsed.saveToWorkspacePath,
+      ctx.extraAllowedRoots ?? [],
+    );
+    await mkdir(dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, "");
+
+    const maxBytes = parsed.maxBytes ?? 20 * 1024 * 1024;
+    let offset = startOffset;
+    let writtenBytes = 0;
+    let lastChunk: PayloadChunkResponse | null = null;
+    while (writtenBytes < maxBytes) {
+      const chunk = await readPayloadChunk(ctx, {
+        eventId: parsed.eventId,
+        offset,
+        limit: Math.min(chunkSize, maxBytes - writtenBytes),
+      });
+      if (chunk.storage === "error") return { error: chunk.chunk };
+      lastChunk = chunk;
+      if (chunk.chunk.length > 0) {
+        const buffer = Buffer.from(chunk.chunk, "utf8");
+        await appendFile(outputPath, buffer);
+        writtenBytes += buffer.length;
+      }
+      offset = chunk.nextOffset;
+      if (chunk.done || chunk.nextOffset <= chunk.offset || chunk.chunk.length === 0) break;
+    }
+
+    return {
+      ok: true,
+      eventId: parsed.eventId,
+      path: outputPath,
+      storage: lastChunk?.storage,
+      totalChars: lastChunk?.totalChars ?? 0,
+      byteLength: lastChunk?.byteLength,
+      startOffset,
+      nextOffset: offset,
+      writtenBytes,
+      complete: Boolean(lastChunk?.done),
+      sha256: lastChunk?.sha256,
+    };
   }
 
   if (tool === "events_scheduled_list") {

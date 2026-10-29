@@ -396,6 +396,15 @@ export const eventReceipts = sqliteTable(
   })
 );
 
+export const eventPayloadBlobs = sqliteTable("event_payload_blobs", {
+  event_id: text("event_id").primaryKey(),
+  storage_path: text("storage_path").notNull(),
+  char_length: integer("char_length").notNull(),
+  byte_length: integer("byte_length").notNull(),
+  sha256: text("sha256").notNull(),
+  created_at: integer("created_at").notNull()
+});
+
 export const processes = sqliteTable("processes", {
   id: text("id").primaryKey(),
   agent_name: text("agent_name").notNull(),
@@ -727,6 +736,7 @@ export const schema = {
   threads,
   events,
   eventReceipts,
+  eventPayloadBlobs,
   processes,
   processOutput,
   files,

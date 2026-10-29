@@ -195,6 +195,7 @@ of truth for ordering and policy.
 ### Events and Delivery
 
 - `events`: append-only event log (`type`, `payload_json`, `source`, `channel_id`, `deliver_at`, `status`, failure counters, idempotency key)
+- `event_payload_blobs`: file-backed storage metadata for oversized event payload JSON spilled out of SQLite
 - `event_receipts`: per-agent delivery state (`PENDING`/`DELIVERED`) used by runner polling
 
 ### Memory Summaries
@@ -246,7 +247,7 @@ already answered them.
 - secret text may be sent as `payload.sensitive.plaintext` (or pre-encrypted `ciphertextB64`)
 - API encrypts plaintext into `payload.sensitive.ciphertextB64` using `ORGOPS_MASTER_KEY` before persistence
 - reveal requires `POST /api/events/:id/reveal-sensitive` with the caller's current password
-- runner guidance tells agents to use `payload.sensitive.plaintext` for one-time tokens; persisted `tool.executed` output for token-creating tools is redacted before insertion into the append-only event log, and all persisted tool output is capped so recursive `events_search` / `tool.executed` payloads cannot grow without bound. Event listings skip JSON-parsing oversized `payload_json` blobs and return a truncated stub instead. `events_search` defaults to 50 compacted events and excludes bookkeeping types (`tool.`, `telemetry.`, `audit.`, `process.`, `wrapper.`, `agent.turn.`, `agent.control.`, `voice.`) unless the caller asks for that family.
+- runner guidance tells agents to use `payload.sensitive.plaintext` for one-time tokens; persisted `tool.executed` output for token-creating tools is redacted before insertion into the append-only event log, and all persisted tool output is capped so recursive `events_search` / `tool.executed` payloads cannot grow without bound. Event listings skip JSON-parsing oversized payloads and return a truncated stub instead. New oversized event payload JSON is spilled to `.orgops-data/event-payloads/` with metadata in `event_payload_blobs`; existing oversized SQLite rows remain readable in bounded chunks. Agents use `events_payload_read` to inspect a large payload deliberately or save it into their workspace for local file tools. `events_search` defaults to 50 compacted events and excludes bookkeeping types (`tool.`, `telemetry.`, `audit.`, `process.`, `wrapper.`, `agent.turn.`, `agent.control.`, `voice.`) unless the caller asks for that family.
 
 Validation is dynamic and composed from:
 
@@ -621,6 +622,7 @@ Presence events (bookkeeping only):
   - `scheduled=1` returns future pending scheduled events
   - `scheduled=1&includeConsumed=1` returns scheduled history (both future and consumed)
 - `GET /api/events/:id`
+- `GET /api/events/:id/payload` (bounded chunk read for oversized DB/file-backed payloads)
 - `PATCH /api/events/:id` (future scheduled `PENDING` events only)
 - `POST /api/events/:id/reveal-sensitive` (human auth + password check; decrypts `message.created.payload.sensitive`)
 - `POST /api/events/:id/ack`
@@ -780,7 +782,7 @@ Current tool families exposed to models:
   - shell commands receive `ORGOPS_AGENT_NAME`, `ORGOPS_AGENT_WORKSPACE` (resolved workspace path), and the agent's resolved secrets as env
 - event/navigation helpers:
   - `events_emit`
-  - `events_channel_messages`, `events_search`
+  - `events_channel_messages`, `events_search`, `events_payload_read`
   - `events_channel_create`, `events_channel_update`, `events_channel_delete`
   - `events_channel_participants`, `events_channel_participant_add`, `events_channel_participant_remove` (participant add/remove supports `AGENT` and `HUMAN`; legacy `agentName` alias still maps to `AGENT`)
   - `events_channels_list`, `events_event_types`, `events_scheduled_create`, `events_schedule_self`
