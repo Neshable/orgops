@@ -15,6 +15,7 @@ import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import type { EventBus } from "@orgops/event-bus";
 import type { AccessControl, RequestUser } from "./access";
 import type { AgentTransferBundle, createAgentTransfer } from "../agent-transfer";
+import {latestAgentStarts} from '../agent-starts';
 
 type AgentTransfer = ReturnType<typeof createAgentTransfer>;
 
@@ -382,6 +383,8 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       : (orm.select().from(schema.agents).all() as any[]);
     const user = c.get("user") as RequestUser | undefined;
     const capabilitiesById = modelCapabilitiesById();
+
+    const starts=latestAgentStarts(orm,rows.filter(row=>access.canViewAgent(user,row.name)).map(row=>row.name));
     return jsonResponse(
       c,
       rows.map((row) => ({
@@ -408,6 +411,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
         desiredState: row.desired_state,
         runtimeState: row.runtime_state,
         lastHeartbeatAt: row.last_heartbeat_at,
+        lastStartedAt: starts.get(row.name) ?? null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         visibility:
@@ -595,6 +599,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       desiredState: row.desired_state,
       runtimeState: row.runtime_state,
       lastHeartbeatAt: row.last_heartbeat_at,
+      lastStartedAt: latestAgentStarts(orm,[row.name]).get(row.name) ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       visibility:

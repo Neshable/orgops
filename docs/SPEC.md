@@ -1031,6 +1031,26 @@ reply with speech: `skills/speak/assets/speak.ts` calls OpenAI text-to-speech
 with `fs_upload`, and posts it with the spoken text. The skill tells agents to
 answer in voice when the human's message carries `payload.voice`.
 
+## Durable agent restart boundaries
+
+Agent list/detail responses include nullable `lastStartedAt`, the engine event
+`createdAt` of the latest trusted `agent.lifecycle.started` (`system:runner`) or
+`wrapper.lifecycle.started` (`system:runner:wrapper`) record targeting that agent.
+Legacy agents with no readable valid record return null. This is derived from
+durable engine history, never heartbeats, settings updates or caller timestamps.
+The 64 KiB metadata guard ignores malformed/oversized lifecycle payloads; only
+agent names and timestamp aggregates enter JS. Migration 049 adds a partial
+lifecycle index so lookups do not scan accumulated tool output.
+
+Consumers can classify an unclosed turn before this boundary as interrupted,
+with an unknown outcome, while retaining explicit completion/failure evidence.
+A later heartbeat alone does not prove interruption; elapsed time does not prove
+completion. External actions may have happened or may still run, so consumers
+must not automatically replay interrupted requests. Existing lifecycle and turn
+events are unchanged; no synthetic successful outcomes or receipt rewrites are
+introduced. Agent visibility/scoped-runner access checks apply to this metadata,
+and lifecycle-channel contents are not included in agent responses.
+
 ### Byte-bounded event listing and delivery
 
 Normal event listings load metadata before payloads, allow at most 64 KiB per
