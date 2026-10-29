@@ -23,6 +23,7 @@ export type RealtimeCallRequest = {
   channelId: string;
   agentName: string;
   sessionId: string;
+  roomId?: string;
   sdp: string;
 };
 
@@ -92,7 +93,7 @@ export function createRealtimeVoice(deps: RealtimeVoiceDeps) {
   }) {
     const soul = input.soul.trim().slice(0, MAX_SOUL_CHARS);
     return [
-      `You are ${input.agentName}, an OrgOps agent in a live voice call with ${input.speaker} in channel "${input.channelName}".`,
+      `You are ${input.agentName}, an OrgOps agent in a live channel voice room with ${input.speaker} in channel "${input.channelName}".`,
       "Speak naturally and keep replies short; the human can interrupt you at any time.",
       soul ? `Your soul:\n${soul}` : "",
     ]
@@ -106,7 +107,7 @@ export function createRealtimeVoice(deps: RealtimeVoiceDeps) {
   ): Promise<RealtimeCallResult> {
     const username = user?.username;
     if (!username || username === "runner") {
-      return { ok: false, status: 403, error: "Realtime voice calls are started by humans" };
+      return { ok: false, status: 403, error: "Realtime voice rooms are started by humans" };
     }
     if (!config().enabled) {
       return { ok: false, status: 503, error: "Realtime voice is unavailable in LLM stub mode" };
@@ -225,11 +226,12 @@ export function createRealtimeVoice(deps: RealtimeVoiceDeps) {
         targetAgentName: agent.name,
         callId,
         sessionId: request.sessionId,
+        ...(request.roomId ? { roomId: request.roomId } : {}),
         provider: "openai",
         model: model.modelName,
         speakerId: username,
         startedAt: Date.now(),
-        text: `${username} started a voice call with ${agent.name}.`,
+        text: `${username} connected ${agent.name} to a voice room.`,
       },
     });
     return { ok: true, sdp: answer, callId, model: model.modelName, agentName: agent.name };

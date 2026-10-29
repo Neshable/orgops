@@ -20,4 +20,17 @@ describe("replyContract capability", () => {
     const caps = resolveModelCapabilities("openai", "gpt-5", { capabilities: { replyContract: "xml" } });
     expect(caps.replyContract).toBeUndefined();
   });
+
+  it("infers realtime audio for Gemini Live and Liquid audio models", () => {
+    expect(resolveModelCapabilities("google", "gemini-2.5-flash-native-audio-preview-09-2025")).toMatchObject({
+      realtimeAudioInput: true,
+      realtimeAudioOutput: true,
+    });
+    expect(resolveModelCapabilities("gemini", "gemini-2.0-flash-live-001").realtimeAudioInput).toBe(true);
+    expect(resolveModelCapabilities("liquid", "lfm3-audio-2b")).toMatchObject({
+      realtimeAudioInput: true,
+      audioOutput: true,
+    });
+    expect(resolveModelCapabilities("openai-compatible", "LFM3-Omni-2B").realtimeAudioInput).toBe(true);
+  });
 });

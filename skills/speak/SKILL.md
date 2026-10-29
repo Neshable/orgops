@@ -13,7 +13,7 @@ Turns your reply text into an audio file and posts it as a voice message. The ch
 - The human explicitly asks you to say something out loud, read something, or reply with voice.
 - Otherwise reply in text as usual. Do not speak long reports, code, tables, or links — summarize what matters in speech and keep the details in the text.
 
-Agents on a realtime voice call already speak natively; this skill is for text agents.
+Agents in a realtime voice room already speak natively; this skill is for text agents.
 
 ## Secrets / auth
 

@@ -54,7 +54,7 @@ Stored in `agents`:
 - secret delegation toggle: `allow_owner_human_secrets` (when enabled and owner exists, user-scoped secrets are injected for native turns)
 - wrapped runtime config: `wrapped_config_json` (JSON object; used only by `WRAPPED` mode)
 
-On API startup, when `agents` is empty, OrgOps seeds one public agent named `system` if `ORGOPS_SYSTEM_AGENT_MODEL` is set. The value is a provider (`openai`, `anthropic`/`claude`, `openrouter`/`or`, `mistral`/`mistralai`) or `provider:model`. A bare provider uses `openai:gpt-5.2`, `anthropic:claude-3-5-sonnet-latest`, `openrouter:openai/gpt-4o-mini`, or `mistral:mistral-small-latest`. Seeding also stores the matching provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or `MISTRAL_API_KEY`) as a public secret and inserts an enabled `models` row with inferred capability metadata. The agent is skipped when the model is unset, the provider is unsupported, the API key is empty, `ORGOPS_MASTER_KEY` cannot encrypt the secret, or any agent row already exists. The seeded agent is unassigned; a runner executes it after `assigned_runner_id` is set.
+On API startup, when `agents` is empty, OrgOps seeds one public agent named `system` if `ORGOPS_SYSTEM_AGENT_MODEL` is set. The value is a provider (`openai`, `anthropic`/`claude`, `openrouter`/`or`, `mistral`/`mistralai`, `liquid`/`liquidai`) or `provider:model`. A bare provider uses `openai:gpt-5.2`, `anthropic:claude-3-5-sonnet-latest`, `openrouter:openai/gpt-4o-mini`, `mistral:mistral-small-latest`, or `liquid:lfm3`. Seeding also stores the matching provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, or `LIQUID_API_KEY`) as a public secret and inserts an enabled `models` row with inferred capability metadata. The agent is skipped when the model is unset, the provider is unsupported, the API key is empty, `ORGOPS_MASTER_KEY` cannot encrypt the secret, or any agent row already exists. The seeded agent is unassigned; a runner executes it after `assigned_runner_id` is set.
 
 `WRAPPED` agents are orgops-owned lifecycle records whose turns are delegated to an external runtime. They do not use orgops memory summaries, prompt composition, skills, model calls, or `allow_outside_workspace` for turn handling. The wrapped runtime owns its own session/memory/tool state and filesystem policy. The runner still injects `ORGOPS_API_URL` and `ORGOPS_RUNNER_TOKEN` into setup/runtime/sidecar processes so the wrapped agent can call the OrgOps HTTP API with `x-orgops-runner-token` (scoped tokens stay limited to that agent and invite-approved channels). `soul_contents` may still be stored on the agent row for humans, opscli, and native management agents; the wrapper runner does not automatically inject it. The creator of the wrapped agent should translate it into the selected harness configuration/setup/runtime behavior when that harness needs a soul or prompt seed.
 
@@ -398,8 +398,10 @@ Published topics include:
 
 Voice is a layer on top of the text channel: everything said becomes an
 ordinary `message.created`, so text-only humans and agents catch up from the
-transcript. There are two paths: voice messages (hold-to-talk, any agent) and
-realtime calls (speech-to-speech with a realtime-capable agent).
+transcript. There are three paths: voice messages (hold-to-talk, any agent),
+direct realtime calls (1:1 speech-to-speech with one realtime-capable agent),
+and channel voice rooms (speech-to-speech with all realtime-capable agents in a
+channel).
 
 Voice message pipeline:
 
@@ -423,51 +425,89 @@ available, else `openai:gpt-4o-mini-transcribe` if `OPENAI_API_KEY` is
 available, else `stub:transcriber` under `ORGOPS_LLM_STUB=1`, else disabled.
 Keys come from the API process env, falling back to public-scope secrets.
 
-- `GET /api/voice/config` → `{ transcription: { enabled, modelId }, realtime: { enabled, provider } }`
+- `GET /api/voice/config` → `{ transcription: { enabled, modelId }, realtime: { enabled, provider, rooms: { enabled, broker, url } } }`
 - `POST /api/voice/transcribe` `{ fileId }` → `{ text, language?, durationInSeconds?, modelId }`
+- `POST /api/voice/rooms/join` `{ channelId, sessionId? }` → direct broker metadata, or a LiveKit room token when `ORGOPS_VOICE_BROKER=livekit`
 
 The UI shows hold-to-talk whenever transcription is enabled.
 
-Realtime calls (`apps/api/src/voice-realtime.ts`, `apps/agent-runner/src/realtime-voice.ts`):
+Direct calls and channel voice rooms (`apps/api/src/voice-realtime.ts`,
+`apps/api/src/voice-broker.ts`, `apps/agent-runner/src/realtime-voice.ts`):
 
 1. When a running channel agent has `modelCapabilities.realtimeAudioInput`, the
-   UI offers "Call <agent>". The browser creates a WebRTC offer (mic track +
-   `oai-events` data channel) and posts it to
-   `POST /api/voice/realtime/calls` `{ channelId, agentName, sessionId, sdp }`
-   → `{ sdp, callId, model, agentName }`.
-2. The API checks the caller can post to the channel, the agent is subscribed,
-   `RUNNING`, and on an OpenAI realtime model, resolves `OPENAI_API_KEY` from the
-   agent's secret scopes (falling back to the API env), and forwards the offer
-   plus a base session (agent name, soul, voice `ORGOPS_REALTIME_VOICE` default
-   `marin`, input transcription, near-field noise reduction) to
-   `https://api.openai.com/v1/realtime/calls`. Audio then flows browser ↔
-   OpenAI directly; the API never relays media. It emits
-   `voice.realtime.call.started` with the provider `callId`.
-3. The assigned runner sees the event in its poll (even if a text turn holds
-   the channel), opens the sideband WebSocket
-   `wss://api.openai.com/v1/realtime?call_id=<callId>` with the agent's key,
-   and sends `session.update` with full instructions (soul, channel context,
-   recent history) and the agent's runner tools as JSON Schema functions.
-4. Tool calls from the model run on the runner host with the same tools and
-   filesystem allowlist as text turns; outputs go back as
-   `function_call_output` items followed by `response.create`.
-5. The runner records both sides as `message.created` in speaking order:
-   human speech from input transcription (`source` = the human), agent speech
-   from output audio transcripts (`source` = the agent), each with
-   `payload.voice = { mode: "realtime", callId, sessionId, interrupted? }`.
-   Replies cut off by barge-in carry `interrupted: true`.
-6. Text posted to the channel during a call is injected into the call as a
-   `[channel] <source>: <text>` item instead of starting a text turn. Its
-   attachments are saved into the agent workspace (paths listed in the note)
-   and images (≤5MB, up to 3) are attached as `input_image`.
-7. Provider server VAD handles turn-taking and barge-in natively. The UI shows
-   connecting / listening / you / thinking / agent / tool states and has mic
-   mute, speaker mute, and hang up.
-8. Hanging up (or page close) emits `voice.realtime.call.ended`; the runner
-   then hangs up the provider call and closes the sideband socket. Agent stop
-   and runner shutdown also end active calls.
+   UI offers both "Call <agent>" and "Join voice room". Direct 1:1 OpenAI calls
+   still use browser WebRTC against `POST /api/voice/realtime/calls`. Channel
+   rooms, and non-OpenAI realtime agents (Gemini Live, Liquid / OpenAI-compatible
+   audio models), use the configured voice broker.
+2. `ORGOPS_VOICE_BROKER=direct-openai-calls` (default) multiplexes one OpenAI
+   WebRTC peer per OpenAI realtime agent in the browser. Audio stays
+   browser ↔ OpenAI; the API never relays media.
+3. `ORGOPS_VOICE_BROKER=livekit` is the SFU room path. The human UI joins via
+   `POST /api/voice/rooms/join` and publishes the microphone with
+   `livekit-client`. The runner joins each realtime agent via
+   `POST /api/voice/rooms/agent-join` (runner token) using `@livekit/rtc-node`,
+   then bridges LiveKit PCM to the agent's realtime provider:
+   OpenAI / Liquid / OpenAI-compatible `/v1/realtime` WebSockets, or Gemini Live
+   `BidiGenerateContent`. Humans hear every agent track. Agents receive humans
+   and peer agents as raw audio, but the runner classifies each provider VAD
+   turn by the LiveKit source identity before it entered the session. Human VAD
+   turns open transcript/reply slots; peer-agent VAD turns are heard by the
+   model, interrupt active output, and defer pending human replies until the
+   peer is quiet, but they are not posted as human speech. Human transcripts
+   are posted once per room turn. Other agents' spoken lines are forwarded as
+   `[voice] agent:<name>:` notes without auto-reply.
+4. OpenAI WebRTC calls still emit `voice.realtime.call.started` with a provider
+   `callId`. LiveKit rooms emit `voice.room.started` (`broker: "livekit"`,
+   `agentNames`) and the runner attaches on that event. Server VAD transcribes
+   the human; the runner then requests a reply after they finish speaking
+   (and after a per-agent stagger in multi-agent rooms); user transcripts are posted
+   before the matching agent reply even when they arrive later, and duplicate
+   human transcripts from a second agent in the same room are dropped. Agent PCM
+   is published as serialized 20ms frames and cleared when the human or another
+   agent starts speaking. Transcripts remain `message.created` with
+   `payload.voice.mode=realtime`. `voice.room.ended` only hangs up the matching
+   `roomId`, so a leftover Hang up / rejoin cannot tear down the new room. If
+   the last `human:` LiveKit participant disconnects (hang up missed, tab
+   closed), agents leave after a short grace period and emit `voice.room.ended`
+   so they cannot keep talking to each other.
+5. Tool calls from any realtime provider run on the runner host with the same
+   tools and filesystem allowlist as text turns.
+6. Text posted to the channel during a call is injected into the live session
+   as a `[channel] <source>: <text>` item instead of starting a text turn.
+   Other agents' realtime transcripts use `[voice]` and do not trigger a
+   response, so a room of several agents does not cascade replies.
+7. Provider server VAD handles barge-in. OpenAI / Liquid / OpenAI-compatible
+   rooms use `server_vad` with `create_response: false` so a shared pause does
+   not make every agent start at once. Tunables:
+   `ORGOPS_REALTIME_VAD_THRESHOLD` (default 0.55),
+   `ORGOPS_REALTIME_VAD_PREFIX_MS` (300),
+   `ORGOPS_REALTIME_VAD_SILENCE_MS` (1100). After the human transcript arrives
+   for a VAD turn, the runner decides which agents should answer (honoring
+   direct mentions like "Ripple" and explicit silence requests), then requests
+   a response, staggered by
+   `ORGOPS_REALTIME_RESPONSE_STAGGER_MS` when more than one agent is in the
+   room. Peer-agent audio defers pending reply timers and cancels active output,
+   so agents can answer sequentially after hearing each other instead of all
+   speaking at once.
+   The UI shows connecting / listening / you / thinking / agent /
+   tool states and has mic mute, speaker mute, and hang up.
+8. Hanging up (or page close) emits `voice.realtime.call.ended` for OpenAI
+   WebRTC legs and `voice.room.ended` for LiveKit rooms. After a reload the UI
+   still shows leftover presence and offers Hang up without being joined, so a
+   crashed tab can close the room. Agent stop and runner shutdown also end
+   active sessions.
 
-Outside calls, an agent on an OpenAI realtime model still handles text, voice
+LiveKit env: `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, optional
+`LIVEKIT_TOKEN_TTL_SECONDS`. For local rooms, install the server binary
+(`brew install livekit`) and run `npm run livekit` (`livekit-server --dev`
+on `127.0.0.1:7880`, keys `devkey` / `secret`). Gemini Live uses
+`GOOGLE_API_KEY` or `GEMINI_API_KEY`. Liquid uses OrgOps secrets
+`LIQUID_API_KEY` and optional `LIQUID_BASE_URL` (default
+`https://labs.liquid.ai/api/v1`, the hosted Liquid Labs OpenAI-compatible
+API). A local llama.cpp `/v1/realtime` server is still possible via
+`OPENAI_COMPATIBLE_*` secrets.
+
+Outside voice rooms, an agent on an OpenAI realtime model still handles text, voice
 messages, and attachments as normal CLASSIC turns. Realtime models are not
 served by chat completions, so `generate()` in `packages/llm`
 (`openai-realtime.ts`) runs them over the Realtime WebSocket in text mode
@@ -493,6 +533,7 @@ in `source`; other events stay `system` records.
 
 Presence events (bookkeeping only):
 
+- `voice.room.started` / `voice.room.ended`
 - `voice.session.started` / `voice.session.ended` (also sent on page close)
 - `voice.participant.muted`
 - `voice.active_speaker.changed`
@@ -853,10 +894,14 @@ Security note: wrapped `source`, `setup.command`, and `runtime.command` are host
 - `ORGOPS_AGENT_INTENT_TIMEOUT_MS`
 - `ORGOPS_AGENT_INTENT_MAX_TIMEOUTS`
 - `ORGOPS_WORKSPACE_PUBLICATION_SYNC_INTERVAL_MS`
-- `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`
+- `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, `LIQUID_API_KEY`
   - for native/wrapped runtime execution with injected env, provider keys are loaded from resolved secrets and do not fall back to host process env
   - when the default `system` agent is seeded, the matching key is copied into a public secret so the runner can inject it
 - `OPENROUTER_BASE_URL`, `OPENROUTER_HTTP_REFERER`, `OPENROUTER_APP_TITLE`
+- `LIQUID_BASE_URL` (optional; defaults to `https://labs.liquid.ai/api/v1`; store with `LIQUID_API_KEY` as OrgOps secrets)
+- `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_COMPATIBLE_BASE_URL` (for local/OpenAI-compatible runtimes)
+- `ORGOPS_VOICE_BROKER` (`direct-openai-calls` default, or `livekit`)
+- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_TOKEN_TTL_SECONDS`
 - `ORGOPS_GIT_BASH_PATH`
 - `ORGOPS_SHELL_PATH`, `ORGOPS_SHELL_ARGS`
 - `ORGOPS_SHELL_TIMEOUT_KILL_GRACE_MS`

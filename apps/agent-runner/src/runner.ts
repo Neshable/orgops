@@ -290,7 +290,7 @@ async function pollAgent(agent: Agent) {
       if (channelLoopManager.isChannelBusy(agent.name, channelId)) {
         // Call setup must not wait for a running text turn to finish.
         return api.listPendingEventsForAgentChannel(agent.name, channelId, {
-          typePrefix: "voice.realtime.",
+          typePrefix: "voice.",
         });
       }
       return api.listPendingEventsForAgentChannel(agent.name, channelId);
@@ -385,6 +385,10 @@ export async function loop() {
   const onShutdownSignal = (signal: NodeJS.Signals) => {
     shuttingDown = true;
     shutdownSignal = signal;
+    setTimeout(() => {
+      console.warn("runner.shutdown_timeout", { signal });
+      process.exit(0);
+    }, 4_000).unref();
   };
   const onSigint = () => onShutdownSignal("SIGINT");
   const onSigterm = () => onShutdownSignal("SIGTERM");
@@ -438,6 +442,13 @@ export async function loop() {
       `runner shutdown (${shutdownSignal ?? "STOP"}): stopped ${processShutdownSummary.terminated} process(es), killed ${processShutdownSummary.killed}`,
     );
   }
+  try {
+    const rtc = await import("@livekit/rtc-node");
+    await Promise.race([
+      Promise.resolve(rtc.dispose()),
+      new Promise((resolve) => setTimeout(resolve, 1_000)),
+    ]);
+  } catch {}
 }
 
 export {

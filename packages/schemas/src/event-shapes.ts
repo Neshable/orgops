@@ -158,6 +158,44 @@ const coreEventShapes: EventShapeDefinition[] = [
     }),
   },
   {
+    type: "voice.room.started",
+    description:
+      "A channel voice room started. Bookkeeping/signaling only; media is carried by the configured voice broker, not the event log.",
+    source: "core",
+    eventSchema: z.object({
+      channelId: z.string().min(1),
+      source: sourceSchema,
+      payload: z
+        .object({
+          roomId: z.string().min(1),
+          sessionId: z.string().min(1),
+          broker: z.string().min(1),
+          agentNames: z.array(z.string().min(1)).optional(),
+          startedAt: z.number().int().nonnegative(),
+          text: z.string().optional(),
+        })
+        .passthrough(),
+    }),
+  },
+  {
+    type: "voice.room.ended",
+    description: "A channel voice room ended. Bookkeeping/signaling only.",
+    source: "core",
+    eventSchema: z.object({
+      channelId: z.string().min(1),
+      source: sourceSchema,
+      payload: z
+        .object({
+          roomId: z.string().min(1),
+          sessionId: z.string().min(1).optional(),
+          endedAt: z.number().int().nonnegative(),
+          reason: z.string().min(1).optional(),
+          text: z.string().optional(),
+        })
+        .passthrough(),
+    }),
+  },
+  {
     type: "voice.session.started",
     description:
       "A participant joined live voice in a channel. Presence bookkeeping only; never wakes agents.",
@@ -230,7 +268,7 @@ const coreEventShapes: EventShapeDefinition[] = [
   {
     type: "voice.realtime.call.started",
     description:
-      "A human opened a provider realtime voice call (WebRTC) with a realtime-capable agent. The agent's runner attaches to the call, supplies instructions and tools, and records both sides' transcripts as message.created with payload.voice.mode=realtime. Never starts a text turn.",
+      "A provider realtime media leg (WebRTC) started for a realtime-capable agent in a channel voice room. The agent's runner attaches to the call, supplies instructions and tools, and records both sides' transcripts as message.created with payload.voice.mode=realtime. Never starts a text turn.",
     source: "core",
     eventSchema: z.object({
       channelId: z.string().min(1),
@@ -240,8 +278,10 @@ const coreEventShapes: EventShapeDefinition[] = [
           targetAgentName: z.string().min(1),
           callId: z.string().min(1),
           sessionId: z.string().min(1),
-          provider: z.literal("openai"),
+          roomId: z.string().min(1).optional(),
+          provider: z.string().min(1),
           model: z.string().min(1),
+          transport: z.enum(["webrtc", "livekit"]).optional(),
           speakerId: z.string().min(1),
           startedAt: z.number().int().nonnegative(),
           text: z.string().optional(),
@@ -252,7 +292,7 @@ const coreEventShapes: EventShapeDefinition[] = [
   {
     type: "voice.realtime.call.ended",
     description:
-      "A realtime voice call ended (human hung up, page closed, or the runner's connection to the call closed).",
+      "A realtime voice room media leg ended (human hung up, page closed, or the runner's connection to the call closed).",
     source: "core",
     eventSchema: z.object({
       channelId: z.string().min(1),
@@ -262,6 +302,7 @@ const coreEventShapes: EventShapeDefinition[] = [
           targetAgentName: z.string().min(1),
           callId: z.string().min(1),
           sessionId: z.string().min(1).optional(),
+          roomId: z.string().min(1).optional(),
           endedAt: z.number().int().nonnegative(),
           reason: z.string().min(1).optional(),
           text: z.string().optional(),

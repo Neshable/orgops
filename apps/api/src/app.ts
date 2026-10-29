@@ -58,6 +58,7 @@ import { registerBillingRoutes } from "./routes/billing";
 import { registerVoiceRoutes } from "./routes/voice";
 import { createVoiceTranscriber } from "./voice-transcriber";
 import { createRealtimeVoice } from "./voice-realtime";
+import { createVoiceBroker } from "./voice-broker";
 import type { transcribe as TranscribeFn } from "@orgops/llm";
 import { registerFederationRoutes } from "./routes/federation";
 import { registerWorkspacePublicationRoutes } from "./routes/workspace-publications";
@@ -753,7 +754,15 @@ export function createApp(config: AppConfig = {}) {
     access,
     fetch: config.realtimeFetch,
   });
-  registerVoiceRoutes(app as any, { jsonResponse, requireAuth, voiceTranscriber, realtimeVoice });
+  const voiceBroker = createVoiceBroker({ orm, access });
+  registerVoiceRoutes(app as any, {
+    jsonResponse,
+    requireAuth,
+    requireRunnerAuth,
+    voiceTranscriber,
+    realtimeVoice,
+    voiceBroker,
+  });
   registerBillingRoutes(app as any, {
     orm,
     jsonResponse,
@@ -772,6 +781,7 @@ const DEFAULT_MODEL_NAME_BY_PROVIDER = {
   anthropic: "claude-3-5-sonnet-latest",
   openrouter: "openai/gpt-4o-mini",
   mistral: "mistral-small-latest",
+  liquid: "lfm3",
 } as const;
 
 const PROVIDER_API_KEY_ENV = {
@@ -779,6 +789,7 @@ const PROVIDER_API_KEY_ENV = {
   anthropic: "ANTHROPIC_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
   mistral: "MISTRAL_API_KEY",
+  liquid: "LIQUID_API_KEY",
 } as const;
 
 type SystemAgentProvider = keyof typeof DEFAULT_MODEL_NAME_BY_PROVIDER;
@@ -789,6 +800,7 @@ function normalizeSystemAgentProvider(raw: string): SystemAgentProvider | null {
   if (normalized === "anthropic" || normalized === "claude") return "anthropic";
   if (normalized === "openrouter" || normalized === "or") return "openrouter";
   if (normalized === "mistral" || normalized === "mistralai") return "mistral";
+  if (normalized === "liquid" || normalized === "liquidai") return "liquid";
   return null;
 }
 

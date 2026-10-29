@@ -62,7 +62,8 @@ export function inferModelCapabilities(providerInput: string, modelNameInput: st
     modelName.includes("claude-4") ||
     modelName.includes("mistral") ||
     modelName.includes("pixtral") ||
-    modelName.includes("gemini")
+    modelName.includes("gemini") ||
+    (provider === "liquid" && (modelName.includes("vl") || modelName.includes("vision")))
   ) {
     capabilities.imageInput = true;
   }
@@ -92,13 +93,29 @@ export function inferModelCapabilities(providerInput: string, modelNameInput: st
     }
   }
 
-  if (provider === "google" && modelName.includes("live")) {
+  if (
+    (provider === "google" || provider === "gemini") &&
+    (modelName.includes("live") || modelName.includes("native-audio"))
+  ) {
     capabilities.audioInput = true;
     capabilities.audioOutput = true;
     capabilities.realtimeAudioInput = true;
     capabilities.realtimeAudioOutput = true;
     capabilities.multiSpeakerRealtimeAudioInput = true;
     capabilities.imageInput = true;
+    capabilities.replyContract = "plain-text";
+  }
+
+  if (
+    (provider === "liquid" || provider === "openai-compatible") &&
+    (modelName.includes("audio") || modelName.includes("realtime") || modelName.includes("omni"))
+  ) {
+    capabilities.audioInput = true;
+    capabilities.audioOutput = true;
+    capabilities.realtimeAudioInput = true;
+    capabilities.realtimeAudioOutput = true;
+    capabilities.activeSpeakerRealtimeAudioInput = true;
+    capabilities.replyContract = "plain-text";
   }
 
   return capabilities;

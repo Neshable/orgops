@@ -74,6 +74,10 @@ describe("llm", () => {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.MISTRAL_API_KEY;
+    delete process.env.LIQUID_API_KEY;
+    delete process.env.LIQUID_BASE_URL;
+    delete process.env.OPENAI_COMPATIBLE_API_KEY;
+    delete process.env.OPENAI_COMPATIBLE_BASE_URL;
   });
 
   it("detects completion-only OpenAI model ids", () => {
@@ -142,6 +146,67 @@ describe("llm", () => {
         apiKey: "scoped-key",
       }),
     );
+  });
+
+  it("uses Liquid as an OpenAI-compatible provider", async () => {
+    process.env.ORGOPS_LLM_STUB = "0";
+    await generate(
+      "liquid:lfm3",
+      [{ role: "user", content: "hello" }],
+      { env: { LIQUID_API_KEY: "liquid-key", LIQUID_BASE_URL: "https://liquid.example/v1" } },
+    );
+    expect(mocks.createOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "liquid-key",
+        baseURL: "https://liquid.example/v1",
+      }),
+    );
+  });
+
+  it("defaults Liquid to the hosted Labs API", async () => {
+    process.env.ORGOPS_LLM_STUB = "0";
+    await generate(
+      "liquid:lfm3",
+      [{ role: "user", content: "hello" }],
+      { env: { LIQUID_API_KEY: "liquid-key" } },
+    );
+    expect(mocks.createOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "liquid-key",
+        baseURL: "https://labs.liquid.ai/api/v1",
+      }),
+    );
+  });
+
+  it("uses generic OpenAI-compatible provider endpoints", async () => {
+    process.env.ORGOPS_LLM_STUB = "0";
+    await generate(
+      "openai-compatible:local-model",
+      [{ role: "user", content: "hello" }],
+      {
+        env: {
+          OPENAI_COMPATIBLE_API_KEY: "local-key",
+          OPENAI_COMPATIBLE_BASE_URL: "http://127.0.0.1:8000/v1",
+        },
+      },
+    );
+    expect(mocks.createOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "local-key",
+        baseURL: "http://127.0.0.1:8000/v1",
+      }),
+    );
+  });
+
+  it("requires a base URL for generic OpenAI-compatible provider endpoints", async () => {
+    process.env.ORGOPS_LLM_STUB = "0";
+    await expect(
+      generate(
+        "openai-compatible:local-model",
+        [{ role: "user", content: "hello" }],
+        { env: { OPENAI_COMPATIBLE_API_KEY: "local-key" } },
+      ),
+    ).rejects.toThrow("OPENAI_COMPATIBLE_BASE_URL is required");
   });
 
   it("rejects unsupported providers", async () => {

@@ -16,6 +16,7 @@ npm run dev:all               # API :8787 + UI :5173 + runner (runner waits for 
 npm run dev:all:clean         # same, but wipes runtime state first
 npm run dev                   # API only
 npm run prod:all              # builds UI, then API + UI preview + runner
+npm run livekit               # local LiveKit SFU for voice rooms (`brew install livekit`)
 
 npm test                      # vitest run (whole repo)
 npm run lint                  # tsc --noEmit across every workspace (there is no eslint)

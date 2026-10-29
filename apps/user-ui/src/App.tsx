@@ -24,6 +24,7 @@ import {
 } from "./voice-capture";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Room, RoomEvent, Track } from "livekit-client";
 
 const MARKDOWN_HINT_RE =
   /(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)|`{1,3}[^`]|(\*\*|__)[^*_]+(\*\*|__)|(\*|_)[^*_]+(\*|_)|\[[^\]]+\]\([^)]+\)|!\[[^\]]*\]\([^)]+\)|(^|\n)\|.+\|/m;
@@ -192,12 +193,25 @@ type VoicePresenceParticipant = {
 
 type VoiceConfig = {
   transcription: { enabled: boolean; modelId: string | null };
-  realtime?: { enabled: boolean; provider: string };
+  realtime?: { enabled: boolean; provider: string; rooms?: { enabled: boolean; broker: string; url?: string | null } };
 };
 
 type RealtimeCallResponse = { sdp: string; callId: string; model: string; agentName: string };
+type VoiceRoomJoinResponse =
+  | { broker: "direct-openai-calls"; mode: "client-multiplex"; roomName: string; sessionId: string }
+  | {
+      broker: "livekit";
+      mode: "sfu";
+      url: string;
+      roomName: string;
+      identity: string;
+      token: string;
+      sessionId: string;
+      expiresAt: number;
+    };
 
 type LiveVoiceActivity = "connecting" | "listening" | "you" | "thinking" | "agent" | "tool";
+type LiveVoiceMode = "room" | "direct";
 
 const VOICE_MIN_RECORDING_MS = 450;
 const VOICE_MAX_RECORDING_MS = 120_000;
@@ -530,7 +544,10 @@ function agentSupportsVoiceInput(agent?: Agent) {
 }
 
 function agentSupportsRealtimeVoiceCall(agent?: Agent) {
-  // Native realtime calls are brokered for OpenAI realtime models only.
+  return Boolean(agent?.modelCapabilities?.realtimeAudioInput);
+}
+
+function agentSupportsDirectOpenAiCall(agent?: Agent) {
   return Boolean(agent?.modelCapabilities?.realtimeAudioInput && agent.modelId?.startsWith("openai:"));
 }
 
@@ -564,6 +581,7 @@ function channelVisibleToUserUi(
   }
   if (channel.visibility !== "PRIVATE") return true;
   if (Boolean(userId && channel.ownerHumanId === userId)) return true;
+  if (channelHasHumanParticipant(channel, username)) return true;
   if (channelHasTeamParticipant(channel, viewerTeamIds)) return true;
   return isSharedToHuman;
 }
@@ -839,14 +857,60 @@ function sourceName(source?: string) {
   return separator >= 0 ? value.slice(separator + 1) : value;
 }
 
+function foldOpenVoiceRooms(voiceEvents: EventRow[]) {
+  const rooms = new Map<string, { roomId: string; sessionId: string }>();
+  for (const event of voiceEvents) {
+    const payload = (event.payload ?? {}) as Record<string, unknown>;
+    const roomId = typeof payload.roomId === "string" ? payload.roomId.trim() : "";
+    if (!roomId) continue;
+    const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
+    if (event.type === "voice.room.started") {
+      rooms.set(roomId, { roomId, sessionId });
+    } else if (event.type === "voice.room.ended") {
+      rooms.delete(roomId);
+    }
+  }
+  return [...rooms.values()];
+}
+
 function foldVoicePresence(voiceEvents: EventRow[], now: number) {
   const sessions = new Map<string, VoicePresenceParticipant>();
+  const sessionRooms = new Map<string, string>();
   let activeSpeaker: { speakerId: string; at: number } | null = null;
   for (const event of voiceEvents) {
     const payload = (event.payload ?? {}) as Record<string, unknown>;
     const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
+    const roomId = typeof payload.roomId === "string" ? payload.roomId.trim() : "";
+    if (event.type === "voice.room.started" && sessionId) {
+      sessionRooms.set(sessionId, roomId);
+      if (!sessions.has(sessionId)) {
+        sessions.set(sessionId, {
+          sessionId,
+          participantId: sourceName(event.source),
+          muted: false,
+          startedAt: event.createdAt ?? now
+        });
+      }
+      continue;
+    }
+    if (event.type === "voice.room.ended") {
+      if (sessionId) {
+        sessions.delete(sessionId);
+        sessionRooms.delete(sessionId);
+      }
+      if (roomId) {
+        for (const [id, ownedRoomId] of sessionRooms) {
+          if (ownedRoomId === roomId) {
+            sessions.delete(id);
+            sessionRooms.delete(id);
+          }
+        }
+      }
+      continue;
+    }
     if (!sessionId) continue;
     if (event.type === "voice.session.started") {
+      if (roomId) sessionRooms.set(sessionId, roomId);
       sessions.set(sessionId, {
         sessionId,
         participantId: sourceName(event.source),
@@ -855,6 +919,7 @@ function foldVoicePresence(voiceEvents: EventRow[], now: number) {
       });
     } else if (event.type === "voice.session.ended") {
       sessions.delete(sessionId);
+      sessionRooms.delete(sessionId);
     } else if (event.type === "voice.participant.muted") {
       const session = sessions.get(sessionId);
       if (session) session.muted = Boolean(payload.muted);
@@ -899,11 +964,16 @@ export default function App() {
   const voicePlaybackQueueRef = useRef<string[]>([]);
   const voicePlaybackActiveRef = useRef<HTMLAudioElement | null>(null);
   const liveVoiceStreamRef = useRef<MediaStream | null>(null);
-  const liveVoicePeerRef = useRef<RTCPeerConnection | null>(null);
+  const liveVoicePeerRefs = useRef<RTCPeerConnection[]>([]);
+  const liveKitRoomRef = useRef<Room | null>(null);
+  const liveKitAudioElementsRef = useRef<HTMLAudioElement[]>([]);
   const liveVoiceAudioRef = useRef<HTMLAudioElement | null>(null);
+  const liveVoiceRemoteStreamRef = useRef<MediaStream | null>(null);
   const liveVoiceMeterRef = useRef<{ stop: () => void } | null>(null);
-  const liveVoiceCallRef = useRef<{ callId: string; agentName: string } | null>(null);
+  const liveVoiceCallsRef = useRef<Array<{ callId: string; agentName: string }>>([]);
   const liveVoiceSessionIdRef = useRef<string | null>(null);
+  const liveVoiceRoomIdRef = useRef<string | null>(null);
+  const liveVoiceModeRef = useRef<LiveVoiceMode | null>(null);
   const liveVoiceChannelIdRef = useRef<string | null>(null);
   const liveVoiceStartedAtRef = useRef(0);
   const liveVoiceSpeakerOnRef = useRef(true);
@@ -1001,10 +1071,11 @@ export default function App() {
   const [liveVoiceStarting, setLiveVoiceStarting] = useState(false);
   const [liveVoiceActivity, setLiveVoiceActivity] = useState<LiveVoiceActivity>("connecting");
   const [liveVoiceToolName, setLiveVoiceToolName] = useState<string | null>(null);
-  const [liveVoiceAgentName, setLiveVoiceAgentName] = useState<string | null>(null);
-  const [liveVoiceTargetAgent, setLiveVoiceTargetAgent] = useState<string | null>(null);
-  const [liveVoiceMenuOpen, setLiveVoiceMenuOpen] = useState(false);
-  const liveVoiceMenuRef = useRef<HTMLDivElement | null>(null);
+  const [liveVoiceAgentNames, setLiveVoiceAgentNames] = useState<string[]>([]);
+  const [liveVoiceMode, setLiveVoiceMode] = useState<LiveVoiceMode | null>(null);
+  const [directVoiceTargetAgent, setDirectVoiceTargetAgent] = useState<string | null>(null);
+  const [directVoiceMenuOpen, setDirectVoiceMenuOpen] = useState(false);
+  const directVoiceMenuRef = useRef<HTMLDivElement | null>(null);
   const [liveVoiceSpeakerOn, setLiveVoiceSpeakerOn] = useState(true);
   const [endedLiveVoiceSessionIds, setEndedLiveVoiceSessionIds] = useState<string[]>([]);
   const [voiceClock, setVoiceClock] = useState(() => Date.now());
@@ -1117,18 +1188,43 @@ export default function App() {
   const realtimeVoiceCapableAgentNames = realtimeVoiceCapableAgents
     .map((agent) => agent.name)
     .filter((name) => !offlineAgentNames.includes(name));
-  const realtimeCallsEnabled =
+  const openaiRealtimeAgentNames = realtimeVoiceCapableAgents
+    .filter((agent) => agentSupportsDirectOpenAiCall(agent) && !offlineAgentNames.includes(agent.name))
+    .map((agent) => agent.name);
+  const voiceRoomBroker = voiceConfig?.realtime?.rooms?.broker ?? "direct-openai-calls";
+  const liveKitRoomsEnabled =
+    voiceRoomBroker === "livekit" && Boolean(voiceConfig?.realtime?.rooms?.enabled);
+  const realtimeDirectCallsEnabled =
     Boolean(voiceConfig?.realtime?.enabled) && typeof RTCPeerConnection !== "undefined";
-  const canStartLiveVoice = realtimeCallsEnabled && realtimeVoiceCapableAgentNames.length > 0;
-  const liveVoiceCallTarget =
-    liveVoiceTargetAgent && realtimeVoiceCapableAgentNames.includes(liveVoiceTargetAgent)
-      ? liveVoiceTargetAgent
-      : realtimeVoiceCapableAgentNames[0] ?? null;
+  const realtimeRoomsEnabled =
+    Boolean(voiceConfig?.realtime?.rooms?.enabled ?? voiceConfig?.realtime?.enabled) &&
+    (liveKitRoomsEnabled || typeof RTCPeerConnection !== "undefined");
+  const roomAgentNames = liveKitRoomsEnabled ? realtimeVoiceCapableAgentNames : openaiRealtimeAgentNames;
+  const directAgentNames = liveKitRoomsEnabled ? realtimeVoiceCapableAgentNames : openaiRealtimeAgentNames;
+  const canStartDirectVoice = realtimeDirectCallsEnabled && directAgentNames.length > 0;
+  const canStartVoiceRoom = realtimeRoomsEnabled && roomAgentNames.length > 0;
+  const canStartLiveVoice = canStartDirectVoice || canStartVoiceRoom;
+  const directVoiceCallTarget =
+    directVoiceTargetAgent && directAgentNames.includes(directVoiceTargetAgent)
+      ? directVoiceTargetAgent
+      : directAgentNames[0] ?? null;
+  const liveVoiceAgentLabel =
+    liveVoiceAgentNames.length === 0
+      ? null
+      : liveVoiceAgentNames.length === 1
+        ? liveVoiceAgentNames[0]
+        : `${liveVoiceAgentNames.length} agents`;
+  const liveVoiceSessionLabel =
+    liveVoiceMode === "direct"
+      ? `Direct call with ${liveVoiceAgentLabel ?? "agent"}`
+      : `Voice room with ${liveVoiceAgentLabel ?? "agents"}`;
   const voicePresence = useMemo(() => foldVoicePresence(voiceEvents, voiceClock), [voiceEvents, voiceClock]);
+  const openVoiceRooms = useMemo(() => foldOpenVoiceRooms(voiceEvents), [voiceEvents]);
   const othersLiveInChannel = voicePresence.participants.filter(
     (participant) =>
       participant.sessionId !== liveVoiceSessionId && !endedLiveVoiceSessionIds.includes(participant.sessionId)
   );
+  const canHangUpWithoutJoin = !liveVoiceSessionId && othersLiveInChannel.length > 0;
   const pendingVoiceForChannel = pendingVoiceNotes.filter((note) => note.channelId === activeChannelId);
   const pendingVoiceMessages = pendingVoiceForChannel.filter((note) => note.mode === "message");
 
@@ -1732,7 +1828,7 @@ export default function App() {
 
   function playNextAgentVoice(lookupAttempt = 0) {
     if (voicePlaybackActiveRef.current) return;
-    if (liveVoiceCallRef.current) {
+    if (liveVoiceCallsRef.current.length > 0) {
       voicePlaybackQueueRef.current = [];
       return;
     }
@@ -1785,11 +1881,18 @@ export default function App() {
       const endedCallId = (event.payload as { callId?: unknown } | undefined)?.callId;
       if (
         endedCallId &&
-        endedCallId === liveVoiceCallRef.current?.callId &&
+        liveVoiceCallsRef.current.some((call) => call.callId === endedCallId) &&
         String(event.source ?? "").startsWith("agent:")
       ) {
-        void stopLiveVoice("agent_disconnected", { notifyAgent: false });
-        setError("The voice call was disconnected.");
+        liveVoiceCallsRef.current = liveVoiceCallsRef.current.filter((call) => call.callId !== endedCallId);
+        const remainingAgentNames = liveVoiceCallsRef.current.map((call) => call.agentName);
+        setLiveVoiceAgentNames(remainingAgentNames);
+        if (remainingAgentNames.length === 0) {
+          void stopLiveVoice("agent_disconnected", { notifyAgent: false });
+          setError(liveVoiceModeRef.current === "direct" ? "The direct voice call was disconnected." : "The voice room was disconnected.");
+        } else {
+          setVoiceHint("One agent left the voice room.");
+        }
       }
     }
     if (event.type?.startsWith("voice.")) {
@@ -1919,28 +2022,41 @@ export default function App() {
   useEffect(() => {
     const endLiveSessionOnExit = () => {
       const sessionId = liveVoiceSessionIdRef.current;
+      const roomId = liveVoiceRoomIdRef.current;
       const channelId = liveVoiceChannelIdRef.current;
-      const call = liveVoiceCallRef.current;
       if (!sessionId || !channelId) return;
       const source = `human:${usernameRef.current || "user"}`;
       const endedAt = Date.now();
       const beacons = [
+        ...(roomId
+          ? [
+              {
+                type: "voice.room.ended",
+                payload: { roomId, sessionId, endedAt, reason: "page_closed" },
+                source,
+                channelId
+              }
+            ]
+          : []),
         {
           type: "voice.session.ended",
           payload: { sessionId, endedAt, reason: "page_closed" },
           source,
           channelId
         },
-        ...(call
-          ? [
-              {
-                type: "voice.realtime.call.ended",
-                payload: { targetAgentName: call.agentName, callId: call.callId, sessionId, endedAt, reason: "page_closed" },
-                source,
-                channelId
-              }
-            ]
-          : [])
+        ...liveVoiceCallsRef.current.map((call) => ({
+          type: "voice.realtime.call.ended",
+          payload: {
+            targetAgentName: call.agentName,
+            callId: call.callId,
+            ...(roomId ? { roomId } : {}),
+            sessionId,
+            endedAt,
+            reason: "page_closed"
+          },
+          source,
+          channelId
+        }))
       ];
       for (const beacon of beacons) {
         void apiFetch("/api/events", {
@@ -1982,7 +2098,14 @@ export default function App() {
     let cancelled = false;
     const channelParam = encodeURIComponent(activeChannelId);
     Promise.all(
-      ["voice.session.started", "voice.session.ended", "voice.participant.muted", "voice.active_speaker.changed"].map(
+      [
+        "voice.room.started",
+        "voice.room.ended",
+        "voice.session.started",
+        "voice.session.ended",
+        "voice.participant.muted",
+        "voice.active_speaker.changed"
+      ].map(
         (type) =>
           apiJson<EventRow[]>(`/api/events?channelId=${channelParam}&type=${type}&limit=50&order=desc`).catch(
             () => [] as EventRow[]
@@ -1999,12 +2122,12 @@ export default function App() {
   }, [authenticated, activeChannelId]);
 
   useEffect(() => {
-    if (!liveVoiceMenuOpen) return;
+    if (!directVoiceMenuOpen) return;
     const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (!liveVoiceMenuRef.current?.contains(event.target as Node)) setLiveVoiceMenuOpen(false);
+      if (!directVoiceMenuRef.current?.contains(event.target as Node)) setDirectVoiceMenuOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setLiveVoiceMenuOpen(false);
+      if (event.key === "Escape") setDirectVoiceMenuOpen(false);
     };
     window.addEventListener("pointerdown", closeOnOutsidePointer);
     window.addEventListener("keydown", closeOnEscape);
@@ -2012,10 +2135,10 @@ export default function App() {
       window.removeEventListener("pointerdown", closeOnOutsidePointer);
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [liveVoiceMenuOpen]);
+  }, [directVoiceMenuOpen]);
 
   useEffect(() => {
-    setLiveVoiceMenuOpen(false);
+    setDirectVoiceMenuOpen(false);
   }, [activeChannelId, liveVoiceSessionId]);
 
   useEffect(() => {
@@ -2910,19 +3033,32 @@ export default function App() {
   function closeLiveVoiceMedia() {
     liveVoiceMeterRef.current?.stop();
     liveVoiceMeterRef.current = null;
-    const peer = liveVoicePeerRef.current;
-    liveVoicePeerRef.current = null;
-    if (peer) {
+    const peers = liveVoicePeerRefs.current;
+    liveVoicePeerRefs.current = [];
+    for (const peer of peers) {
       peer.ontrack = null;
       peer.onconnectionstatechange = null;
       peer.close();
     }
+    const liveKitRoom = liveKitRoomRef.current;
+    liveKitRoomRef.current = null;
+    if (liveKitRoom) {
+      liveKitRoom.removeAllListeners();
+      liveKitRoom.disconnect();
+    }
+    for (const element of liveKitAudioElementsRef.current) {
+      element.pause();
+      element.srcObject = null;
+      element.remove();
+    }
+    liveKitAudioElementsRef.current = [];
     const audio = liveVoiceAudioRef.current;
     liveVoiceAudioRef.current = null;
     if (audio) {
       audio.pause();
       audio.srcObject = null;
     }
+    liveVoiceRemoteStreamRef.current = null;
     liveVoiceStreamRef.current?.getTracks().forEach((track) => track.stop());
     liveVoiceStreamRef.current = null;
   }
@@ -2936,7 +3072,7 @@ export default function App() {
     } catch {
       // Not a JSON API error body.
     }
-    return message || "Unable to start the voice call";
+    return message || "Unable to start the voice room";
   }
 
   function handleRealtimeDataEvent(message: { type?: string; item?: { type?: string; name?: string }; error?: { message?: string } }) {
@@ -2981,64 +3117,161 @@ export default function App() {
     }
   }
 
-  async function startLiveVoice() {
-    if (liveVoiceSessionIdRef.current || liveVoiceStarting || !canStartLiveVoice) return;
+  async function connectLiveKitVoiceRoom(input: {
+    channelId: string;
+    sessionId: string;
+    stream: MediaStream;
+  }) {
+    const join = await apiJson<VoiceRoomJoinResponse>("/api/voice/rooms/join", {
+      method: "POST",
+      headers: getApiHeaders(),
+      body: JSON.stringify({ channelId: input.channelId, sessionId: input.sessionId })
+    });
+    if (join.broker !== "livekit") return null;
+    const room = new Room();
+    const attachRemoteAudio = (track: { kind: string; attach: () => HTMLMediaElement }) => {
+      if (track.kind !== Track.Kind.Audio) return;
+      const element = track.attach() as HTMLAudioElement;
+      element.autoplay = true;
+      element.muted = !liveVoiceSpeakerOnRef.current;
+      element.style.display = "none";
+      document.body.appendChild(element);
+      liveKitAudioElementsRef.current = [...liveKitAudioElementsRef.current, element];
+      void element.play().catch(() => undefined);
+      setLiveVoiceActivity((current) => (current === "connecting" ? "listening" : current));
+    };
+    room.on(RoomEvent.TrackSubscribed, (track) => {
+      attachRemoteAudio(track);
+    });
+    room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+      const identities = speakers.map((speaker) => speaker.identity);
+      if (identities.some((identity) => identity.startsWith("agent:"))) {
+        setLiveVoiceActivity("agent");
+        return;
+      }
+      if (identities.some((identity) => identity.startsWith("human:"))) {
+        setLiveVoiceActivity("you");
+        return;
+      }
+      setLiveVoiceActivity((current) => (current === "connecting" ? "listening" : current === "you" || current === "agent" ? "listening" : current));
+    });
+    room.on(RoomEvent.Connected, () => {
+      setLiveVoiceActivity((current) => (current === "connecting" ? "listening" : current));
+    });
+    room.on(RoomEvent.TrackUnsubscribed, (track) => {
+      for (const element of track.detach()) {
+        element.pause();
+        element.srcObject = null;
+        element.remove();
+        liveKitAudioElementsRef.current = liveKitAudioElementsRef.current.filter((candidate) => candidate !== element);
+      }
+    });
+    await room.connect(join.url, join.token);
+    for (const participant of room.remoteParticipants.values()) {
+      for (const publication of participant.audioTrackPublications.values()) {
+        if (publication.track) attachRemoteAudio(publication.track);
+      }
+    }
+    for (const track of input.stream.getAudioTracks()) {
+      await room.localParticipant.publishTrack(track, { source: Track.Source.Microphone });
+    }
+    liveKitRoomRef.current = room;
+    return join;
+  }
+
+  async function startLiveVoice(mode: LiveVoiceMode) {
+    if (
+      liveVoiceSessionIdRef.current ||
+      liveVoiceStarting ||
+      (mode === "room" ? !canStartVoiceRoom : !canStartDirectVoice)
+    ) {
+      return;
+    }
     voicePlaybackActiveRef.current?.pause();
     const channelId = activeChannelIdRef.current || activeChannelId;
-    const agentName = liveVoiceCallTarget;
-    if (!channelId || !agentName) return;
+    const agentNames =
+      mode === "direct"
+        ? directVoiceCallTarget
+          ? [directVoiceCallTarget]
+          : []
+        : [...roomAgentNames];
+    if (!channelId || agentNames.length === 0) return;
+    if (mode === "direct" && (othersLiveInChannel.length > 0 || openVoiceRooms.length > 0)) {
+      await endChannelVoicePresence("rejoined");
+    }
     if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
-      setError("Voice calls are not supported in this browser.");
+      setError(`${mode === "room" ? "Voice rooms" : "Direct voice calls"} are not supported in this browser.`);
       return;
     }
     setLiveVoiceStarting(true);
     setLiveVoiceActivity("connecting");
     setLiveVoiceToolName(null);
     const sessionId = crypto.randomUUID();
+    const usesLiveKit =
+      liveKitRoomsEnabled &&
+      (mode === "room" || !agentNames.every((name) => openaiRealtimeAgentNames.includes(name)));
+    const existingRoom = mode === "room" ? openVoiceRooms[0] : null;
+    const roomId = existingRoom?.roomId ?? (mode === "room" || usesLiveKit ? crypto.randomUUID() : null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
       liveVoiceStreamRef.current = stream;
-      const peer = new RTCPeerConnection();
-      liveVoicePeerRef.current = peer;
+      const remoteStream = new MediaStream();
+      liveVoiceRemoteStreamRef.current = remoteStream;
       const audio = new Audio();
       audio.autoplay = true;
       audio.muted = !liveVoiceSpeakerOnRef.current;
+      audio.srcObject = remoteStream;
       liveVoiceAudioRef.current = audio;
-      peer.ontrack = (event) => {
-        audio.srcObject = event.streams[0] ?? new MediaStream([event.track]);
-        void audio.play().catch(() => undefined);
-      };
-      peer.onconnectionstatechange = () => {
-        if (liveVoicePeerRef.current !== peer) return;
-        if (peer.connectionState === "connected") {
-          setLiveVoiceActivity((current) => (current === "connecting" ? "listening" : current));
-        } else if (peer.connectionState === "failed") {
-          setError("The voice call connection failed.");
-          void stopLiveVoice("connection_failed");
+      const liveKitJoin = usesLiveKit
+        ? await connectLiveKitVoiceRoom({ channelId, sessionId, stream })
+        : null;
+
+      const calls: Array<{ callId: string; agentName: string }> = [];
+      if (!usesLiveKit) {
+        for (const agentName of agentNames) {
+          const peer = new RTCPeerConnection();
+          liveVoicePeerRefs.current = [...liveVoicePeerRefs.current, peer];
+          peer.ontrack = (event) => {
+            remoteStream.addTrack(event.track);
+            void audio.play().catch(() => undefined);
+          };
+          peer.onconnectionstatechange = () => {
+            if (!liveVoicePeerRefs.current.includes(peer)) return;
+            if (liveVoicePeerRefs.current.some((candidate) => candidate.connectionState === "connected")) {
+              setLiveVoiceActivity((current) => (current === "connecting" ? "listening" : current));
+            }
+            if (peer.connectionState === "failed") {
+              setError(`${agentName}'s ${mode === "room" ? "voice room" : "direct voice"} connection failed.`);
+            }
+          };
+          for (const track of stream.getAudioTracks()) peer.addTrack(track, stream);
+          const events = peer.createDataChannel("oai-events");
+          events.onmessage = (event) => {
+            try {
+              handleRealtimeDataEvent(JSON.parse(String(event.data)));
+            } catch {
+              // Ignore non-JSON frames.
+            }
+          };
+          const offer = await peer.createOffer();
+          await peer.setLocalDescription(offer);
+          const call = await apiJson<RealtimeCallResponse>("/api/voice/realtime/calls", {
+            method: "POST",
+            headers: getApiHeaders(),
+            body: JSON.stringify({ channelId, agentName, sessionId, roomId: roomId ?? undefined, sdp: offer.sdp })
+          });
+          await peer.setRemoteDescription({ type: "answer", sdp: call.sdp });
+          calls.push({ callId: call.callId, agentName: call.agentName });
         }
-      };
-      for (const track of stream.getAudioTracks()) peer.addTrack(track, stream);
-      const events = peer.createDataChannel("oai-events");
-      events.onmessage = (event) => {
-        try {
-          handleRealtimeDataEvent(JSON.parse(String(event.data)));
-        } catch {
-          // Ignore non-JSON frames.
-        }
-      };
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      const call = await apiJson<RealtimeCallResponse>("/api/voice/realtime/calls", {
-        method: "POST",
-        headers: getApiHeaders(),
-        body: JSON.stringify({ channelId, agentName, sessionId, sdp: offer.sdp })
-      });
-      await peer.setRemoteDescription({ type: "answer", sdp: call.sdp });
+      }
+
       const now = Date.now();
-      liveVoiceCallRef.current = { callId: call.callId, agentName: call.agentName };
+      liveVoiceCallsRef.current = calls;
       liveVoiceSessionIdRef.current = sessionId;
+      liveVoiceRoomIdRef.current = roomId;
+      liveVoiceModeRef.current = mode;
       liveVoiceChannelIdRef.current = channelId;
       liveVoiceStartedAtRef.current = now;
       lastActiveSpeakerRef.current = null;
@@ -3046,23 +3279,50 @@ export default function App() {
         liveVoiceLevelRef.current?.style.setProperty("--voice-level", level.toFixed(3))
       );
       setLiveVoiceSessionId(sessionId);
-      setLiveVoiceAgentName(call.agentName);
+      setLiveVoiceAgentNames(usesLiveKit ? agentNames : calls.map((call) => call.agentName));
+      setLiveVoiceMode(mode);
       setLiveVoiceMuted(false);
       setError(null);
       setVoiceHint(null);
       const speaker = username || "user";
+      if (roomId && !existingRoom) {
+        await emitVoiceEvent(
+          "voice.room.started",
+          {
+            roomId,
+            sessionId,
+            broker: voiceConfig?.realtime?.rooms?.broker ?? "direct-openai-calls",
+            agentNames,
+            startedAt: now,
+            ...(liveKitJoin ? { brokerRoomName: liveKitJoin.roomName } : {}),
+            text: `${speaker} started a voice room with ${agentNames.join(", ")}.`
+          },
+          channelId
+        ).catch(() => undefined);
+      }
       await emitVoiceEvent(
         "voice.session.started",
-        { sessionId, startedAt: now, text: `${speaker} joined a voice call with ${call.agentName}.` },
+        {
+          sessionId,
+          ...(roomId ? { roomId } : {}),
+          startedAt: now,
+          text:
+            mode === "room"
+              ? `${speaker} joined the voice room.`
+              : `${speaker} started a direct voice call with ${agentNames[0] ?? "an agent"}.`
+        },
         channelId
       ).catch(() => undefined);
     } catch (voiceError) {
       closeLiveVoiceMedia();
-      liveVoiceCallRef.current = null;
+      liveVoiceCallsRef.current = [];
       liveVoiceSessionIdRef.current = null;
+      liveVoiceRoomIdRef.current = null;
+      liveVoiceModeRef.current = null;
       liveVoiceChannelIdRef.current = null;
       setLiveVoiceSessionId(null);
-      setLiveVoiceAgentName(null);
+      setLiveVoiceAgentNames([]);
+      setLiveVoiceMode(null);
       setError(liveVoiceErrorMessage(voiceError));
     } finally {
       setLiveVoiceStarting(false);
@@ -3094,36 +3354,99 @@ export default function App() {
     liveVoiceSpeakerOnRef.current = next;
     setLiveVoiceSpeakerOn(next);
     if (liveVoiceAudioRef.current) liveVoiceAudioRef.current.muted = !next;
+    for (const element of liveKitAudioElementsRef.current) element.muted = !next;
   }
 
   async function stopLiveVoice(reason = "left", options: { notifyAgent?: boolean } = {}) {
     const sessionId = liveVoiceSessionIdRef.current;
+    const roomId = liveVoiceRoomIdRef.current;
+    const mode = liveVoiceModeRef.current;
     const channelId = liveVoiceChannelIdRef.current;
-    const call = liveVoiceCallRef.current;
-    liveVoiceCallRef.current = null;
+    const calls = liveVoiceCallsRef.current;
+    liveVoiceCallsRef.current = [];
     liveVoiceSessionIdRef.current = null;
+    liveVoiceRoomIdRef.current = null;
+    liveVoiceModeRef.current = null;
     liveVoiceChannelIdRef.current = null;
     closeLiveVoiceMedia();
     setLiveVoiceSessionId(null);
-    setLiveVoiceAgentName(null);
+    setLiveVoiceAgentNames([]);
+    setLiveVoiceMode(null);
     setLiveVoiceMuted(false);
     setLiveVoiceActivity("connecting");
     setLiveVoiceToolName(null);
     if (!sessionId || !channelId) return;
     setEndedLiveVoiceSessionIds((current) => [...current.slice(-20), sessionId]);
     const endedAt = Date.now();
-    if (call && options.notifyAgent !== false) {
+    if (options.notifyAgent !== false) {
+      await Promise.all(
+        calls.map((call) =>
+          emitVoiceEvent(
+            "voice.realtime.call.ended",
+            { targetAgentName: call.agentName, callId: call.callId, roomId: roomId ?? undefined, sessionId, endedAt, reason },
+            channelId
+          ).catch(() => undefined)
+        )
+      );
+    }
+    if (roomId) {
       await emitVoiceEvent(
-        "voice.realtime.call.ended",
-        { targetAgentName: call.agentName, callId: call.callId, sessionId, endedAt, reason },
+        "voice.room.ended",
+        { roomId, sessionId, endedAt, reason, text: `${username || "A human"} ended the voice room.` },
         channelId
       ).catch(() => undefined);
     }
     await emitVoiceEvent(
       "voice.session.ended",
-      { sessionId, endedAt, reason, text: `${username || "A human"} left the voice call.` },
+      {
+        sessionId,
+        endedAt,
+        reason,
+        text:
+          mode === "direct"
+            ? `${username || "A human"} ended the direct voice call.`
+            : `${username || "A human"} left the voice room.`
+      },
       channelId
     ).catch(() => undefined);
+  }
+
+  async function endChannelVoicePresence(reason = "ended") {
+    const channelId = activeChannelIdRef.current || activeChannelId;
+    if (!channelId) return;
+    const sessionIds = othersLiveInChannel.map((participant) => participant.sessionId);
+    const rooms = openVoiceRooms;
+    if (sessionIds.length === 0 && rooms.length === 0) return;
+    setEndedLiveVoiceSessionIds((current) => [...current.slice(-20), ...sessionIds]);
+    const endedAt = Date.now();
+    const speaker = username || "A human";
+    await Promise.all([
+      ...sessionIds.map((sessionId) =>
+        emitVoiceEvent(
+          "voice.session.ended",
+          {
+            sessionId,
+            endedAt,
+            reason,
+            text: `${speaker} ended a leftover voice session.`
+          },
+          channelId
+        ).catch(() => undefined)
+      ),
+      ...rooms.map((room) =>
+        emitVoiceEvent(
+          "voice.room.ended",
+          {
+            roomId: room.roomId,
+            sessionId: room.sessionId,
+            endedAt,
+            reason,
+            text: `${speaker} ended the voice room.`
+          },
+          channelId
+        ).catch(() => undefined)
+      )
+    ]);
   }
 
   function clearVoiceRecordingTimers() {
@@ -4079,8 +4402,8 @@ export default function App() {
                 <span className="live-voice-dot" aria-hidden="true" />
                 <strong>
                   {liveVoiceSessionId
-                    ? `Call with ${liveVoiceAgentName ?? "agent"} · ${formatVoiceDuration(voiceClock - liveVoiceStartedAtRef.current)}`
-                    : "Voice call in progress"}
+                    ? `${liveVoiceSessionLabel} · ${formatVoiceDuration(voiceClock - liveVoiceStartedAtRef.current)}`
+                    : "Voice in progress"}
                 </strong>
                 {liveVoiceSessionId ? (
                   <span
@@ -4096,7 +4419,7 @@ export default function App() {
                           : liveVoiceActivity === "thinking"
                             ? "Thinking..."
                             : liveVoiceActivity === "agent"
-                              ? `${liveVoiceAgentName ?? "Agent"} is speaking`
+                              ? `${liveVoiceAgentLabel ?? "Agent"} speaking`
                               : liveVoiceActivity === "tool"
                                 ? `Running ${liveVoiceToolName ?? "a tool"}...`
                                 : "Listening"}
@@ -4108,14 +4431,14 @@ export default function App() {
                   </span>
                 ) : null}
               </div>
-              <ul className="live-voice-participants" aria-label="People in voice calls">
+              <ul className="live-voice-participants" aria-label="People in voice rooms">
                 {liveVoiceSessionId ? (
                   <>
                     <li className={liveVoiceActivity === "you" && !liveVoiceMuted ? "is-speaking" : liveVoiceMuted ? "is-muted" : ""}>
                       You{liveVoiceMuted ? " · muted" : ""}
                     </li>
                     <li className={liveVoiceActivity === "agent" ? "is-speaking is-agent" : "is-agent"}>
-                      {liveVoiceAgentName}
+                      {liveVoiceAgentLabel}
                     </li>
                   </>
                 ) : null}
@@ -4137,9 +4460,11 @@ export default function App() {
               </ul>
               <p className="live-voice-hint">
                 {liveVoiceSessionId
-                  ? `Realtime voice with ${liveVoiceAgentName ?? "the agent"}: interrupt any time. Both sides are transcribed into the channel.`
-                  : canStartLiveVoice && liveVoiceCallTarget
-                    ? `Others are on their own calls. Use "Call ${liveVoiceCallTarget}" below to start yours.`
+                  ? liveVoiceMode === "direct"
+                    ? `Direct realtime voice with ${liveVoiceAgentLabel ?? "the agent"}: interrupt any time. Both sides are transcribed into the channel.`
+                    : `Realtime voice room with ${liveVoiceAgentLabel ?? "the agents"}: interrupt any time. The room is transcribed into the channel.`
+                  : canStartVoiceRoom
+                    ? "Others are in voice. Join the room below to talk with the channel's realtime agents."
                     : "Transcripts of the call appear in the channel."}
               </p>
               <div className="live-voice-controls">
@@ -4157,7 +4482,7 @@ export default function App() {
                       type="button"
                       className={`composer-secondary${liveVoiceSpeakerOn ? "" : " is-active"}`}
                       aria-pressed={!liveVoiceSpeakerOn}
-                      title={`Silence ${liveVoiceAgentName ?? "the agent"} on this device`}
+                      title="Silence agent audio on this device"
                       onClick={toggleLiveVoiceSpeaker}
                     >
                       {liveVoiceSpeakerOn ? "Speaker off" : "Speaker on"}
@@ -4166,6 +4491,14 @@ export default function App() {
                       Hang up
                     </button>
                   </>
+                ) : canHangUpWithoutJoin ? (
+                  <button
+                    type="button"
+                    className="live-voice-leave"
+                    onClick={() => void endChannelVoicePresence("left")}
+                  >
+                    Hang up
+                  </button>
                 ) : null}
               </div>
             </section>
@@ -4235,49 +4568,62 @@ export default function App() {
             rows={isConversationEmpty ? 1 : 3}
           />
           <div className="composer-actions">
-            {canStartLiveVoice && liveVoiceCallTarget && !liveVoiceSessionId ? (
-              <div className="composer-call" ref={liveVoiceMenuRef}>
+            {canStartVoiceRoom && !liveVoiceSessionId ? (
+              <div className="composer-call">
                 <button
                   type="button"
                   className="composer-secondary composer-live-voice"
                   disabled={liveVoiceCallDisabled}
-                  title={`Start a realtime voice call with ${liveVoiceCallTarget}. You can interrupt it, and both sides are transcribed into the channel.`}
-                  onClick={() => void startLiveVoice()}
+                  title="Join a realtime channel voice room. Agent audio is mixed locally and transcribed into the channel."
+                  onClick={() => void startLiveVoice("room")}
                 >
-                  {liveVoiceStarting ? "Connecting..." : `Call ${liveVoiceCallTarget}`}
+                  {liveVoiceStarting ? "Connecting..." : `Join voice room (${roomAgentNames.length})`}
                 </button>
-                {realtimeVoiceCapableAgentNames.length > 1 ? (
+              </div>
+            ) : null}
+            {canStartDirectVoice && directVoiceCallTarget && !liveVoiceSessionId ? (
+              <div className="composer-call" ref={directVoiceMenuRef}>
+                <button
+                  type="button"
+                  className="composer-secondary composer-live-voice"
+                  disabled={liveVoiceCallDisabled}
+                  title={`Start a direct realtime voice call with ${directVoiceCallTarget}.`}
+                  onClick={() => void startLiveVoice("direct")}
+                >
+                  {liveVoiceStarting ? "Connecting..." : `Call ${directVoiceCallTarget}`}
+                </button>
+                {directAgentNames.length > 1 ? (
                   <>
                     <button
                       type="button"
                       className="composer-secondary composer-call-toggle"
-                      aria-label="Choose which agent to call"
+                      aria-label="Choose direct call agent"
                       aria-haspopup="menu"
-                      aria-expanded={liveVoiceMenuOpen}
+                      aria-expanded={directVoiceMenuOpen}
                       disabled={liveVoiceCallDisabled}
-                      onClick={() => setLiveVoiceMenuOpen((open) => !open)}
+                      onClick={() => setDirectVoiceMenuOpen((open) => !open)}
                     >
                       <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
                         <path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                     </button>
-                    {liveVoiceMenuOpen ? (
-                      <div className="composer-call-menu" role="menu" aria-label="Agent to call">
-                        <p className="composer-call-menu-title">Call with</p>
-                        {realtimeVoiceCapableAgentNames.map((name) => (
+                    {directVoiceMenuOpen ? (
+                      <div className="composer-call-menu" role="menu" aria-label="Agent for direct call">
+                        <p className="composer-call-menu-title">Direct call with</p>
+                        {directAgentNames.map((name) => (
                           <button
                             type="button"
                             role="menuitemradio"
-                            aria-checked={name === liveVoiceCallTarget}
-                            className={`composer-call-option${name === liveVoiceCallTarget ? " is-selected" : ""}`}
+                            aria-checked={name === directVoiceCallTarget}
+                            className={`composer-call-option${name === directVoiceCallTarget ? " is-selected" : ""}`}
                             key={name}
                             onClick={() => {
-                              setLiveVoiceTargetAgent(name);
-                              setLiveVoiceMenuOpen(false);
+                              setDirectVoiceTargetAgent(name);
+                              setDirectVoiceMenuOpen(false);
                             }}
                           >
                             <span>{name}</span>
-                            {name === liveVoiceCallTarget ? <span aria-hidden="true">✓</span> : null}
+                            {name === directVoiceCallTarget ? <span aria-hidden="true">✓</span> : null}
                           </button>
                         ))}
                       </div>

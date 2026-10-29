@@ -75,6 +75,12 @@ const PROVIDER_SECRET_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "OPENROUTER_API_KEY",
   "MISTRAL_API_KEY",
+  "LIQUID_API_KEY",
+  "LIQUID_BASE_URL",
+  "OPENAI_COMPATIBLE_API_KEY",
+  "OPENAI_COMPATIBLE_BASE_URL",
+  "GOOGLE_API_KEY",
+  "GEMINI_API_KEY",
 ] as const;
 
 function normalizeToolsForSdk(tools?: Record<string, LlmTool>) {
@@ -121,6 +127,9 @@ function normalizeProvider(provider: string) {
   if (normalized === "claude") return "anthropic";
   if (normalized === "or") return "openrouter";
   if (normalized === "mistralai") return "mistral";
+  if (normalized === "liquidai") return "liquid";
+  if (normalized === "gemini") return "google";
+  if (normalized === "openai_compatible" || normalized === "openai-compatible") return "openai-compatible";
   return normalized;
 }
 
@@ -343,6 +352,22 @@ export async function generate(
   } else if (provider === "mistral") {
     const mistral = createMistral({ apiKey: env.MISTRAL_API_KEY });
     model = mistral(modelName);
+  } else if (provider === "liquid") {
+    const liquid = createOpenAI({
+      apiKey: env.LIQUID_API_KEY,
+      baseURL: env.LIQUID_BASE_URL || "https://labs.liquid.ai/api/v1",
+    });
+    model = liquid.chat(modelName);
+  } else if (provider === "openai-compatible") {
+    const baseURL = env.OPENAI_COMPATIBLE_BASE_URL?.trim();
+    if (!baseURL) {
+      throw new Error("OPENAI_COMPATIBLE_BASE_URL is required for openai-compatible models.");
+    }
+    const compatible = createOpenAI({
+      apiKey: env.OPENAI_COMPATIBLE_API_KEY,
+      baseURL,
+    });
+    model = compatible.chat(modelName);
   } else {
     throw new Error(`Unsupported provider: ${rawProvider}`);
   }

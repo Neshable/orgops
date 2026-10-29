@@ -133,6 +133,8 @@ it("routes target lists without widening legacy targets or bypassing exclusions"
 
 it("treats voice presence and raw audio as bookkeeping but wakes on transcribed speech", () => {
   for (const type of [
+    "voice.room.started",
+    "voice.room.ended",
     "voice.session.started",
     "voice.session.ended",
     "voice.participant.muted",

@@ -11,10 +11,23 @@ import { createRunnerTools, executeTool, type ExecuteContext } from "./tools";
 import { redactPersistedToolOutput } from "./tools/types";
 import type { RunnerApi } from "./runner/api";
 import type { Agent, Event } from "./types";
+import {
+  defaultLiveKitRoomFactory,
+  type LiveKitParticipantHandle,
+  type LiveKitRoomFactory,
+} from "./livekit-room";
+import {
+  connectVoiceRuntime,
+  isRealtimeVoiceModel,
+  resolveVoiceRuntimeCredentials,
+  type VoiceRuntimeSession,
+} from "./voice-runtime";
 
 export const OPENAI_REALTIME_BASE_URL = "https://api.openai.com/v1/realtime";
 const OPENAI_REALTIME_SOCKET_URL = "wss://api.openai.com/v1/realtime";
 const USER_TRANSCRIPT_WAIT_MS = 8_000;
+const USER_TRANSCRIPT_DEDUPE_MS = 8_000;
+const PEER_AUDIO_HOLD_MS = 600;
 const MAX_TOOL_OUTPUT_CHARS = 12_000;
 const MAX_HISTORY_MESSAGES = 30;
 const MAX_HISTORY_MESSAGE_CHARS = 600;
@@ -33,6 +46,7 @@ type RealtimeVoiceDeps = {
   connect?: (url: string, headers: Record<string, string>) => RealtimeSocket;
   fetch?: typeof fetch;
   executeTool?: (ctx: ExecuteContext, tool: string, args: Record<string, unknown>) => Promise<unknown>;
+  createLiveKitRoom?: LiveKitRoomFactory;
 };
 
 type OutboxSlot = {
@@ -59,6 +73,19 @@ type RealtimeCall = {
   responseText: Map<string, string[]>;
   handledToolCallIds: Set<string>;
   executeCtx: ExecuteContext | null;
+  transport: "webrtc" | "livekit";
+  roomId?: string;
+  provider: string;
+  runtime?: VoiceRuntimeSession;
+  livekit?: LiveKitParticipantHandle;
+  pendingUserSlotKeys: string[];
+  userTurnSeq: number;
+  peerAudioUntil: number;
+  lastInputKind: "human" | "agent" | "unknown";
+  vadTurnKind: "human" | "agent" | "unknown";
+  activeResponseId: string;
+  responseTimer?: ReturnType<typeof setTimeout>;
+  responseTimerResolve?: () => void;
 };
 
 type CallStartedPayload = {
@@ -114,14 +141,16 @@ export function buildRealtimeInstructions(input: {
     .filter(Boolean)
     .join("\n");
   return [
-    `You are ${input.agent.name}, an OrgOps agent in a live voice call with ${input.speakerId} in channel "${channelName}" (${input.channelId}).`,
+    `You are ${input.agent.name}, an OrgOps agent in a live channel voice room with ${input.speakerId} in channel "${channelName}" (${input.channelId}).`,
     [
       "Voice call rules:",
       "- Speak naturally and keep replies short. No markdown, lists, or code read aloud; summarize instead.",
+      "- Wait until the human finishes speaking before you reply. Do not talk over them.",
       "- The human can interrupt you; stop and listen when they do.",
       "- Both sides of this call are transcribed into the channel automatically. Do not use tools to post what you say.",
       "- Use your tools to act on your host and OrgOps. Say briefly what you are about to do before slow work, then report the outcome.",
       "- Channel text posted during the call reaches you as notes starting with [channel]. Attachments are saved into your workspace (paths listed in the note) and images are shown to you; open other files with your tools.",
+      "- You also hear other agents in this room. Notes starting with [voice] name who just spoke. Do not greet or talk over them; stop if another agent starts speaking.",
     ].join("\n"),
     `Your workspace: ${input.agent.workspacePath}`,
     input.channel?.description ? `Channel description: ${input.channel.description}` : "",
@@ -133,12 +162,28 @@ export function buildRealtimeInstructions(input: {
     .join("\n\n");
 }
 
+function splitModelId(modelId: string) {
+  const colon = modelId.indexOf(":");
+  const provider = colon > 0 ? modelId.slice(0, colon).trim().toLowerCase() : "";
+  const modelName = colon > 0 ? modelId.slice(colon + 1).trim() : modelId.trim();
+  return { provider, modelName };
+}
+
+function agentIsRealtimeCapable(agent: Agent) {
+  if (agent.modelCapabilities?.realtimeAudioInput) return true;
+  const { provider, modelName } = splitModelId(agent.modelId);
+  return isRealtimeVoiceModel(provider, modelName);
+}
+
 export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
   const connect = deps.connect ?? defaultConnect;
   const fetchImpl = deps.fetch ?? fetch;
   const runTool = deps.executeTool ?? executeTool;
+  const createLiveKitRoom = deps.createLiveKitRoom ?? defaultLiveKitRoomFactory;
   const calls = new Map<string, RealtimeCall>();
   const inFlight = new Set<Promise<unknown>>();
+  const hangingUp = new Set<string>();
+  const postedUserTranscripts = new Map<string, number>();
 
   function track(promise: Promise<unknown>, label: string) {
     const tracked = promise.catch((error) => {
@@ -155,8 +200,155 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
     );
   }
 
+  function callsOnChannel(channelId: string) {
+    return [...calls.values()].filter((call) => call.channelId === channelId);
+  }
+
   function hasActiveCall(agentName: string, channelId: string) {
     return callsFor(agentName, channelId).length > 0;
+  }
+
+  function normalizeUtterance(text: string) {
+    return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  }
+
+  function claimUserTranscript(roomKey: string, text: string) {
+    const normalized = normalizeUtterance(text);
+    if (!normalized) return false;
+    const key = `${roomKey}:${normalized}`;
+    const now = Date.now();
+    const previous = postedUserTranscripts.get(key);
+    if (previous && now - previous < USER_TRANSCRIPT_DEDUPE_MS) return false;
+    postedUserTranscripts.set(key, now);
+    return true;
+  }
+
+  function textMentionsAgent(text: string, agentName: string) {
+    const normalizedText = normalizeUtterance(text);
+    const normalizedName = normalizeUtterance(agentName);
+    if (!normalizedText || !normalizedName) return false;
+    return new RegExp(`(^| )${normalizedName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}( |$)`).test(normalizedText);
+  }
+
+  function asksForSilence(text: string) {
+    return /\b(do not|don't|dont|stop|stay silent|remain silent|be quiet|don't answer|do not answer|don't respond|do not respond)\b/i.test(text);
+  }
+
+  function shouldReplyToHumanTranscript(call: RealtimeCall, text: string) {
+    const activeNames = callsOnChannel(call.channelId).map((entry) => entry.agent.name);
+    const rawMentioned = activeNames.filter((name) => textMentionsAgent(text, name));
+    const mentioned = rawMentioned.filter((name) => {
+      const normalizedName = normalizeUtterance(name);
+      return !rawMentioned.some((other) => {
+        const normalizedOther = normalizeUtterance(other);
+        return other !== name && normalizedOther.startsWith(`${normalizedName} `);
+      });
+    });
+    const silence = asksForSilence(text);
+    if (silence && mentioned.length === 0) return false;
+    if (silence && textMentionsAgent(text, call.agent.name)) return false;
+    if (mentioned.length > 0) return mentioned.includes(call.agent.name);
+    return true;
+  }
+
+  function ingestRemoteAudio(call: RealtimeCall, frame: { pcm: Int16Array; sampleRate: number; identity: string }) {
+    const identity = String(frame.identity ?? "");
+    if (identity === `agent:${call.agent.name}`) return;
+    if (identity.startsWith("agent:")) {
+      call.lastInputKind = "agent";
+      interruptActiveResponse(call);
+      call.peerAudioUntil = Date.now() + PEER_AUDIO_HOLD_MS;
+      call.runtime?.sendAudio(frame.pcm, frame.sampleRate);
+      return;
+    }
+    if (identity.startsWith("human:")) {
+      call.lastInputKind = "human";
+      call.peerAudioUntil = 0;
+      call.runtime?.sendAudio(frame.pcm, frame.sampleRate);
+    }
+  }
+
+  function cancelPendingResponse(call: RealtimeCall) {
+    if (call.responseTimer) {
+      clearTimeout(call.responseTimer);
+      call.responseTimer = undefined;
+    }
+    call.responseTimerResolve?.();
+    call.responseTimerResolve = undefined;
+  }
+
+  function interruptActiveResponse(call: RealtimeCall) {
+    call.livekit?.interrupt();
+    const responseId = call.activeResponseId;
+    if (!responseId) return;
+    call.activeResponseId = "";
+    call.responseText.delete(responseId);
+    resolveSlot(call, `assistant:${responseId}`, null);
+    call.runtime?.cancelResponse();
+  }
+
+  function responseStaggerMs(call: RealtimeCall) {
+    const peers = callsOnChannel(call.channelId).length;
+    if (peers <= 1) return 0;
+    const spread = Math.round(
+      Number.isFinite(Number(process.env.ORGOPS_REALTIME_RESPONSE_STAGGER_MS))
+        ? Number(process.env.ORGOPS_REALTIME_RESPONSE_STAGGER_MS)
+        : 700,
+    );
+    if (spread <= 0) return 0;
+    let hash = 2166136261;
+    for (const ch of call.agent.name) {
+      hash ^= ch.charCodeAt(0);
+      hash = Math.imul(hash, 16777619);
+    }
+    return 80 + ((hash >>> 0) % spread);
+  }
+
+  function scheduleResponse(call: RealtimeCall) {
+    cancelPendingResponse(call);
+    if (call.ended || !call.runtime) return;
+    const delay = responseStaggerMs(call);
+    const scheduled = new Promise<void>((resolve) => {
+      call.responseTimerResolve = resolve;
+      call.responseTimer = setTimeout(() => {
+        call.responseTimer = undefined;
+        call.responseTimerResolve = undefined;
+        try {
+          const peerWaitMs = Math.max(0, (call.peerAudioUntil ?? 0) - Date.now());
+          if (!call.ended && peerWaitMs > 0) {
+            scheduleResponseAfter(call, peerWaitMs + responseStaggerMs(call));
+          } else if (!call.ended) {
+            call.runtime?.requestResponse();
+          }
+        } finally {
+          resolve();
+        }
+      }, delay);
+    });
+    track(scheduled, "realtime.request_response_failed");
+  }
+
+  function scheduleResponseAfter(call: RealtimeCall, delay: number) {
+    cancelPendingResponse(call);
+    if (call.ended || !call.runtime) return;
+    const scheduled = new Promise<void>((resolve) => {
+      call.responseTimerResolve = resolve;
+      call.responseTimer = setTimeout(() => {
+        call.responseTimer = undefined;
+        call.responseTimerResolve = undefined;
+        try {
+          const peerWaitMs = Math.max(0, (call.peerAudioUntil ?? 0) - Date.now());
+          if (!call.ended && peerWaitMs > 0) {
+            scheduleResponseAfter(call, peerWaitMs + responseStaggerMs(call));
+          } else if (!call.ended) {
+            call.runtime?.requestResponse();
+          }
+        } finally {
+          resolve();
+        }
+      }, Math.max(0, delay));
+    });
+    track(scheduled, "realtime.request_response_failed");
   }
 
   function send(call: RealtimeCall, message: Record<string, unknown>) {
@@ -218,7 +410,7 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
       callId: call.callId,
       sessionId: call.sessionId,
       agentName: call.agent.name,
-      transcribedBy: `openai:${call.model}`,
+      transcribedBy: `${call.provider}:${call.model}`,
       ...extra,
     };
   }
@@ -366,19 +558,56 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
     } catch {
       serialized = String(output);
     }
+    const truncated = truncate(serialized, MAX_TOOL_OUTPUT_CHARS);
+    if (call.runtime) {
+      call.runtime.sendToolResult(toolCallId, truncated);
+      return true;
+    }
     send(call, {
       type: "conversation.item.create",
       item: {
         type: "function_call_output",
         call_id: toolCallId,
-        output: truncate(serialized, MAX_TOOL_OUTPUT_CHARS),
+        output: truncated,
       },
     });
     return true;
   }
 
+  function injectNote(
+    call: RealtimeCall,
+    note: string,
+    images: Array<{ type: "input_image"; image_url: string }> = [],
+    createResponse = true,
+  ) {
+    if (call.runtime) {
+      call.runtime.sendText(note, images, { createResponse });
+      return;
+    }
+    send(call, {
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: note }, ...images],
+      },
+    });
+    if (createResponse) send(call, { type: "response.create" });
+  }
+
+  function fanOutPeerVoice(from: RealtimeCall, text: string) {
+    const spoken = text.trim();
+    if (!spoken) return;
+    const note = `[voice] agent:${from.agent.name}: ${truncate(spoken, 4000)}`;
+    for (const other of callsOnChannel(from.channelId)) {
+      if (other.callId === from.callId) continue;
+      injectNote(other, note, [], false);
+    }
+  }
+
   async function handleResponseDone(call: RealtimeCall, response: any) {
     const responseId = String(response?.id ?? "");
+    if (!responseId || call.activeResponseId === responseId) call.activeResponseId = "";
     const spoken = (call.responseText.get(responseId) ?? []).join(" ").trim();
     call.responseText.delete(responseId);
     const interrupted = response?.status === "cancelled";
@@ -397,6 +626,7 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
           }
         : null,
     );
+    if (spoken && !interrupted) fanOutPeerVoice(call, spoken);
     const toolItems = (Array.isArray(response?.output) ? response.output : []).filter(
       (item: any) => item?.type === "function_call",
     );
@@ -462,6 +692,7 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
   function finalizeCall(call: RealtimeCall, reason: string) {
     if (call.ended) return;
     call.ended = true;
+    cancelPendingResponse(call);
     calls.delete(call.callId);
     for (const slot of call.outbox) {
       if (!slot.resolved) {
@@ -511,6 +742,14 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
       responseText: new Map(),
       handledToolCallIds: new Set(),
       executeCtx: null,
+      transport: "webrtc",
+      provider: "openai",
+      pendingUserSlotKeys: [],
+      userTurnSeq: 0,
+      peerAudioUntil: 0,
+      lastInputKind: "unknown",
+      vadTurnKind: "unknown",
+      activeResponseId: "",
     };
     calls.set(callId, call);
     if (!apiKey) {
@@ -550,18 +789,231 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
     socket.addEventListener("close", () => finalizeCall(call, "disconnected"));
   }
 
-  async function hangup(call: RealtimeCall, reason: string, closedByHuman: boolean) {
-    call.closedByHuman = call.closedByHuman || closedByHuman;
-    if (call.apiKey) {
-      await fetchImpl(`${OPENAI_REALTIME_BASE_URL}/calls/${encodeURIComponent(call.callId)}/hangup`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${call.apiKey}` },
-      }).catch(() => undefined);
+  function handleRuntimeEvent(call: RealtimeCall, event: import("./voice-runtime").VoiceRuntimeEvent) {
+    switch (event.type) {
+      case "ready":
+        return;
+      case "speech_started":
+        call.vadTurnKind = call.lastInputKind;
+        if (call.vadTurnKind === "human") {
+          cancelPendingResponse(call);
+          call.userTurnSeq += 1;
+          {
+            const key = `user:pending:${call.userTurnSeq}`;
+            call.pendingUserSlotKeys.push(key);
+            openSlot(call, key, USER_TRANSCRIPT_WAIT_MS);
+          }
+          call.peerAudioUntil = 0;
+          interruptActiveResponse(call);
+        }
+        return;
+      case "speech_stopped":
+        call.vadTurnKind = "unknown";
+        return;
+      case "user_transcript": {
+        const text = event.text.trim();
+        const key = call.pendingUserSlotKeys.shift();
+        if (!key) return;
+        const roomKey = call.roomId || call.channelId;
+        const shouldPost = Boolean(text) && claimUserTranscript(roomKey, text);
+        resolveSlot(
+          call,
+          key,
+          shouldPost
+            ? {
+                type: "message.created",
+                source: call.speakerSource,
+                channelId: call.channelId,
+                payload: { text, voice: voiceMeta(call, { speakerId: call.speakerId }) },
+              }
+            : null,
+        );
+        if (text && shouldReplyToHumanTranscript(call, text)) scheduleResponse(call);
+        return;
+      }
+      case "assistant_started":
+        call.activeResponseId = event.responseId;
+        openSlot(call, `assistant:${event.responseId}`);
+        return;
+      case "assistant_transcript": {
+        if (!event.responseId || !event.text) return;
+        const parts = call.responseText.get(event.responseId) ?? [];
+        parts.push(event.text);
+        call.responseText.set(event.responseId, parts);
+        return;
+      }
+      case "assistant_done":
+        if (!event.responseId || call.activeResponseId === event.responseId) call.activeResponseId = "";
+        void call.livekit?.flush().catch(() => undefined);
+        track(
+          handleResponseDone(call, {
+            id: event.responseId,
+            status: event.interrupted ? "cancelled" : "completed",
+            output: [],
+          }),
+          "realtime.response_done_failed",
+        );
+        return;
+      case "tool_call":
+        track(runToolCall(call, { call_id: event.callId, name: event.name, arguments: event.arguments }).then((ran) => {
+          if (ran && call.socket) send(call, { type: "response.create" });
+        }), "realtime.tool_failed");
+        return;
+      case "audio":
+        void call.livekit?.publish(event.pcm, event.sampleRate).catch((error) => {
+          console.warn("realtime.publish_failed", { callId: call.callId, error: String(error) });
+        });
+        return;
+      case "error":
+        console.warn("realtime.runtime_error", { callId: call.callId, error: event.message });
+        return;
+      case "closed":
+        finalizeCall(call, "disconnected");
+        return;
+      default:
+        return;
     }
+  }
+
+  async function attachRoom(agent: Agent, event: Event) {
+    const payload = payloadOf(event);
+    const channelId = event.channelId;
+    const roomId = String(payload.roomId ?? "").trim();
+    if (!channelId || !roomId || !agentIsRealtimeCapable(agent)) return;
+    const named = payload.agentNames;
+    if (Array.isArray(named) && named.length > 0 && !named.includes(agent.name)) return;
+    const callId = `lk:${roomId}:${agent.name}`;
+    if (calls.has(callId)) return;
+    const env = await deps.api.getPackageSecretsEnv(agent.name, channelId).catch(() => ({}) as Record<string, string>);
+    const { provider, modelName } = splitModelId(agent.modelId);
+    const credentials = resolveVoiceRuntimeCredentials(provider, { ...process.env, ...env });
+    const call: RealtimeCall = {
+      callId,
+      agent,
+      channelId,
+      sessionId: String(payload.sessionId ?? roomId),
+      speakerSource: event.source,
+      speakerId: String(payload.speakerId ?? event.source.replace(/^human:/, "")),
+      model: modelName,
+      apiKey: credentials?.apiKey ?? "",
+      socket: null,
+      closedByHuman: false,
+      ended: false,
+      outbox: [],
+      posting: Promise.resolve(),
+      responseText: new Map(),
+      handledToolCallIds: new Set(),
+      executeCtx: null,
+      transport: "livekit",
+      roomId,
+      provider,
+      pendingUserSlotKeys: [],
+      userTurnSeq: 0,
+      peerAudioUntil: 0,
+      lastInputKind: "unknown",
+      vadTurnKind: "unknown",
+      activeResponseId: "",
+    };
+    calls.set(callId, call);
+    if (!credentials) {
+      console.warn("realtime.missing_provider_key", { agent: agent.name, provider, callId });
+      finalizeCall(call, "missing_provider_key");
+      return;
+    }
+    const joinRes = await deps.api.apiFetch("/api/voice/rooms/agent-join", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ channelId, agentName: agent.name, sessionId: call.sessionId }),
+    });
+    const join = (await joinRes.json()) as {
+      broker?: string;
+      url?: string;
+      token?: string;
+      error?: string;
+    };
+    if (join.broker !== "livekit" || !join.url || !join.token) {
+      finalizeCall(call, join.error || "livekit_join_failed");
+      return;
+    }
+    const sessionUpdate = await buildSessionUpdate(call, event, env);
+    const tools = Array.isArray(sessionUpdate.session.tools)
+      ? sessionUpdate.session.tools.map((tool: any) => ({
+          name: String(tool.name ?? ""),
+          description: String(tool.description ?? ""),
+          parameters: (tool.parameters ?? { type: "object" }) as Record<string, unknown>,
+        }))
+      : [];
+    call.runtime = connectVoiceRuntime({
+      provider,
+      model: modelName,
+      apiKey: credentials.apiKey,
+      baseUrl: credentials.baseUrl,
+      instructions: String(sessionUpdate.session.instructions ?? ""),
+      tools,
+      onEvent: (runtimeEvent) => handleRuntimeEvent(call, runtimeEvent),
+      connect: (url, headers) => connect(url, headers ?? {}),
+    });
+    call.livekit = createLiveKitRoom({
+      url: join.url,
+      token: join.token,
+      selfIdentity: `agent:${agent.name}`,
+      onAudio: (frame) => ingestRemoteAudio(call, frame),
+      onDisconnected: () => finalizeCall(call, "livekit_disconnected"),
+      onHumansLeft: () => {
+        track(hangup(call, "humans_left", true), "realtime.humans_left_hangup_failed");
+      },
+    });
+    console.log("realtime.room_attach", { callId, agent: agent.name, provider, model: modelName, url: join.url });
+    await call.livekit.connect();
+  }
+
+  async function hangup(call: RealtimeCall, reason: string, closedByHuman: boolean) {
+    if (call.ended || hangingUp.has(call.callId)) return;
+    hangingUp.add(call.callId);
+    call.closedByHuman = call.closedByHuman || closedByHuman;
+    console.log("realtime.room_hangup", { callId: call.callId, agent: call.agent.name, reason });
     try {
-      call.socket?.close(1000, reason);
-    } catch {}
-    finalizeCall(call, reason);
+      if (call.transport === "livekit") {
+        try {
+          call.runtime?.close(reason);
+        } catch {}
+        await Promise.race([
+          call.livekit?.disconnect().catch(() => undefined) ?? Promise.resolve(),
+          new Promise((resolve) => setTimeout(resolve, 2_000)),
+        ]);
+        if (reason === "humans_left" && call.roomId) {
+          track(
+            emitBestEffort({
+              type: "voice.room.ended",
+              source: `agent:${call.agent.name}`,
+              channelId: call.channelId,
+              payload: {
+                roomId: call.roomId,
+                sessionId: call.sessionId,
+                endedAt: Date.now(),
+                reason,
+                text: `${call.agent.name} left the voice room after all humans disconnected.`,
+              },
+            }),
+            "realtime.humans_left_ended_emit_failed",
+          );
+        }
+        finalizeCall(call, reason);
+        return;
+      }
+      if (call.apiKey) {
+        await fetchImpl(`${OPENAI_REALTIME_BASE_URL}/calls/${encodeURIComponent(call.callId)}/hangup`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${call.apiKey}` },
+        }).catch(() => undefined);
+      }
+      try {
+        call.socket?.close(1000, reason);
+      } catch {}
+      finalizeCall(call, reason);
+    } finally {
+      hangingUp.delete(call.callId);
+    }
   }
 
   async function injectChannelMessage(call: RealtimeCall, event: Event) {
@@ -586,18 +1038,13 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
         });
       }
     }
-    const lines = [`[channel] ${event.source}: ${truncate(text, 4000)}`];
+    const voice = isRealtimeVoiceMessage(event);
+    const prefix = voice ? "[voice]" : "[channel]";
+    const lines = [`${prefix} ${event.source}: ${truncate(text, 4000)}`];
     if (fileLines.length > 0) {
       lines.push(`Attachments saved in your workspace (images are also attached here):\n${fileLines.join("\n")}`);
     }
-    send(call, {
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: lines.join("\n") }, ...images],
-      },
-    });
+    injectNote(call, lines.join("\n"), images, !voice);
   }
 
   /**
@@ -609,8 +1056,24 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
     const remaining: Event[] = [];
     for (const event of events) {
       const payload = payloadOf(event);
+      if (event.type === "voice.room.started") {
+        if (String(payload.broker ?? "") === "livekit") {
+          track(attachRoom(agent, event), "realtime.room_attach_failed");
+        }
+        continue;
+      }
+      if (event.type === "voice.room.ended") {
+        const roomId = String(payload.roomId ?? "").trim();
+        if (!roomId) continue;
+        for (const call of callsFor(agent.name, event.channelId)) {
+          if (call.transport === "livekit" && call.roomId === roomId) {
+            track(hangup(call, String(payload.reason ?? "room_ended"), true), "realtime.room_hangup_failed");
+          }
+        }
+        continue;
+      }
       if (event.type === "voice.realtime.call.started") {
-        if (payload.targetAgentName === agent.name) {
+        if (payload.targetAgentName === agent.name && payload.transport !== "livekit") {
           track(attach(agent, event), "realtime.attach_failed");
         }
         continue;
@@ -623,7 +1086,11 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
         continue;
       }
       if (event.channelId && event.type === "message.created" && hasActiveCall(agent.name, event.channelId)) {
-        if (!isRealtimeVoiceMessage(event) && event.source !== `agent:${agent.name}`) {
+        const self = event.source === `agent:${agent.name}`;
+        const voice = isRealtimeVoiceMessage(event);
+        const peerAgentName = event.source.startsWith("agent:") ? event.source.slice("agent:".length) : "";
+        const peerIsLocal = Boolean(peerAgentName) && hasActiveCall(peerAgentName, event.channelId);
+        if (!self && (!voice || (peerAgentName && peerAgentName !== agent.name && !peerIsLocal))) {
           for (const call of callsFor(agent.name, event.channelId)) {
             track(injectChannelMessage(call, event), "realtime.inject_failed");
           }

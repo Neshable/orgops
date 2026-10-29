@@ -63,11 +63,11 @@ async function setup(respond?: (call: FetchCall) => Response) {
     });
   }
 
-  async function startCall(agentName: string) {
+  async function startCall(agentName: string, roomId?: string) {
     const res = await app.request("http://localhost/api/voice/realtime/calls", {
       method: "POST",
       headers: json,
-      body: JSON.stringify({ channelId: channel.id, agentName, sessionId: "session-1", sdp: "v=0\r\noffer" }),
+      body: JSON.stringify({ channelId: channel.id, agentName, sessionId: "session-1", roomId, sdp: "v=0\r\noffer" }),
     });
     return { status: res.status, body: (await res.json()) as any };
   }
@@ -106,7 +106,7 @@ describe("realtime voice calls", () => {
     const ctx = await setup();
     await ctx.addAgent("voice-agent", "openai:gpt-realtime");
 
-    const result = await ctx.startCall("voice-agent");
+    const result = await ctx.startCall("voice-agent", "room-1");
 
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
@@ -134,6 +134,7 @@ describe("realtime voice calls", () => {
       targetAgentName: "voice-agent",
       callId: "rtc_test123",
       sessionId: "session-1",
+      roomId: "room-1",
       provider: "openai",
       speakerId: "admin",
     });

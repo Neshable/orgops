@@ -122,7 +122,7 @@ describe("realtime voice manager", () => {
     expect(socket.headers.Authorization).toBe("Bearer sk-agent");
     const update = socket.sent.find((message) => message.type === "session.update");
     expect(update.session.type).toBe("realtime");
-    expect(update.session.instructions).toContain("live voice call with alice");
+    expect(update.session.instructions).toContain("live channel voice room with alice");
     expect(update.session.instructions).toContain("payments on-call desk");
     expect(update.session.instructions).toContain("human:bob: Deploy is at 3pm.");
     const shellRun = update.session.tools.find((tool: any) => tool.name === "shell_run");
@@ -269,5 +269,681 @@ describe("realtime voice manager", () => {
     ]);
     await flush();
     expect(ctx.sockets).toHaveLength(0);
+  });
+
+  it("posts LiveKit human transcripts before agent replies even when they land late", async () => {
+    const sockets: FakeSocket[] = [];
+    const emitted: any[] = [];
+    const interrupted: string[] = [];
+    let onAudio: ((frame: { pcm: Int16Array; sampleRate: number; identity: string }) => void) | undefined;
+    const manager = createRealtimeVoiceManager({
+      api: {
+        apiFetch: async (path) => {
+          if (path === "/api/voice/rooms/agent-join") {
+            return new Response(
+              JSON.stringify({
+                broker: "livekit",
+                url: "ws://127.0.0.1:7880",
+                token: "lk-token",
+                identity: "agent:voice-agent",
+              }),
+            );
+          }
+          return new Response(JSON.stringify([]));
+        },
+        emitEvent: async (event) => {
+          emitted.push(event);
+        },
+        getPackageSecretsEnv: async () => ({ OPENAI_API_KEY: "sk-agent" }),
+        getChannelRecord: async () => ({ id: "chan-1", name: "payments" }) as any,
+      },
+      skillRoots: [],
+      connect: (url, headers) => {
+        const socket = new FakeSocket(url, headers);
+        sockets.push(socket);
+        return socket;
+      },
+      createLiveKitRoom: (input) => {
+        onAudio = input.onAudio;
+        return {
+          connect: async () => undefined,
+          disconnect: async () => undefined,
+          interrupt: () => interrupted.push("cleared"),
+          flush: async () => undefined,
+          publish: async () => undefined,
+        };
+      },
+    });
+
+    manager.consume(agent, [
+      {
+        id: "evt-room",
+        type: "voice.room.started",
+        source: "human:alice",
+        channelId: "chan-1",
+        payload: {
+          roomId: "room-1",
+          sessionId: "session-1",
+          broker: "livekit",
+          agentNames: ["voice-agent"],
+          startedAt: 1,
+        },
+      },
+    ]);
+    await manager.idle();
+    const socket = sockets[0]!;
+    socket.fire("open", {});
+    socket.server({ type: "session.created" });
+    socket.server({ type: "session.updated" });
+    onAudio?.({ pcm: new Int16Array([1, 2, 3, 4]), sampleRate: 48_000, identity: "human:alice" });
+    socket.server({ type: "input_audio_buffer.speech_started" });
+    expect(emitted.filter((event) => event.type === "message.created")).toHaveLength(0);
+    socket.server({
+      type: "conversation.item.input_audio_transcription.completed",
+      item_id: "item_user",
+      transcript: "Hello",
+    });
+    await manager.idle();
+    expect(socket.sent.filter((message) => message.type === "response.create")).toEqual([
+      { type: "response.create" },
+    ]);
+    socket.server({ type: "response.created", response: { id: "resp_1" } });
+    socket.server({
+      type: "response.output_audio_transcript.done",
+      response_id: "resp_1",
+      transcript: "Hi there, welcome to the room!",
+    });
+    socket.server({ type: "response.done", response: { id: "resp_1", status: "completed", output: [] } });
+    await manager.idle();
+    expect(interrupted.length).toBeGreaterThanOrEqual(0);
+    expect(
+      emitted.filter((event) => event.type === "message.created").map((event) => [event.source, event.payload.text]),
+    ).toEqual([
+      ["human:alice", "Hello"],
+      ["agent:voice-agent", "Hi there, welcome to the room!"],
+    ]);
+    await manager.endAll("test");
+  });
+
+  it("forwards one agent's spoken line into the other agent's live session without a reply", async () => {
+    const sockets: FakeSocket[] = [];
+    const peer: Agent = { ...agent, name: "voice-agent-2" };
+    const manager = createRealtimeVoiceManager({
+      api: {
+        apiFetch: async (path) => {
+          if (path === "/api/voice/rooms/agent-join") {
+            return new Response(
+              JSON.stringify({
+                broker: "livekit",
+                url: "ws://127.0.0.1:7880",
+                token: "lk-token",
+                identity: "agent:peer",
+              }),
+            );
+          }
+          return new Response(JSON.stringify([]));
+        },
+        emitEvent: async () => undefined,
+        getPackageSecretsEnv: async () => ({ OPENAI_API_KEY: "sk-agent" }),
+        getChannelRecord: async () => ({ id: "chan-1", name: "payments" }) as any,
+      },
+      skillRoots: [],
+      connect: (url, headers) => {
+        const socket = new FakeSocket(url, headers);
+        sockets.push(socket);
+        return socket;
+      },
+      createLiveKitRoom: () => ({
+        connect: async () => undefined,
+        disconnect: async () => undefined,
+        interrupt: () => undefined,
+        flush: async () => undefined,
+        publish: async () => undefined,
+      }),
+    });
+    const started: Event = {
+      id: "evt-room",
+      type: "voice.room.started",
+      source: "human:alice",
+      channelId: "chan-1",
+      payload: {
+        roomId: "room-1",
+        sessionId: "session-1",
+        broker: "livekit",
+        agentNames: ["voice-agent", "voice-agent-2"],
+        startedAt: 1,
+      },
+    };
+    manager.consume(agent, [started]);
+    manager.consume(peer, [{ ...started, id: "evt-room-2" }]);
+    await manager.idle();
+    expect(sockets).toHaveLength(2);
+    for (const socket of sockets) {
+      socket.fire("open", {});
+      socket.server({ type: "session.created" });
+      socket.server({ type: "session.updated" });
+    }
+    sockets[0]!.server({ type: "response.created", response: { id: "resp_a" } });
+    sockets[0]!.server({
+      type: "response.output_audio_transcript.done",
+      response_id: "resp_a",
+      transcript: "I am agent one.",
+    });
+    sockets[0]!.server({ type: "response.done", response: { id: "resp_a", status: "completed", output: [] } });
+    await manager.idle();
+    const peerNotes = sockets[1]!.sent.filter((message) => message.type === "conversation.item.create");
+    expect(peerNotes.map((message) => message.item.content[0].text)).toEqual([
+      "[voice] agent:voice-agent: I am agent one.",
+    ]);
+    expect(sockets[1]!.sent.filter((message) => message.type === "response.create")).toEqual([]);
+    await manager.endAll("test");
+  });
+
+  it("hangs up the LiveKit room when the last human leaves", async () => {
+    const emitted: any[] = [];
+    let humansLeft: (() => void) | undefined;
+    const manager = createRealtimeVoiceManager({
+      api: {
+        apiFetch: async (path) => {
+          if (path === "/api/voice/rooms/agent-join") {
+            return new Response(
+              JSON.stringify({
+                broker: "livekit",
+                url: "ws://127.0.0.1:7880",
+                token: "lk-token",
+                identity: "agent:voice-agent",
+              }),
+            );
+          }
+          return new Response(JSON.stringify([]));
+        },
+        emitEvent: async (event) => {
+          emitted.push(event);
+        },
+        getPackageSecretsEnv: async () => ({ OPENAI_API_KEY: "sk-agent" }),
+        getChannelRecord: async () => ({ id: "chan-1", name: "payments" }) as any,
+      },
+      skillRoots: [],
+      connect: (url, headers) => new FakeSocket(url, headers),
+      createLiveKitRoom: ({ onHumansLeft }) => {
+        humansLeft = onHumansLeft;
+        return {
+          connect: async () => undefined,
+          disconnect: async () => undefined,
+          interrupt: () => undefined,
+          flush: async () => undefined,
+          publish: async () => undefined,
+        };
+      },
+    });
+    manager.consume(agent, [
+      {
+        id: "evt-room",
+        type: "voice.room.started",
+        source: "human:alice",
+        channelId: "chan-1",
+        payload: {
+          roomId: "room-1",
+          sessionId: "session-1",
+          broker: "livekit",
+          agentNames: ["voice-agent"],
+          startedAt: 1,
+        },
+      },
+    ]);
+    await manager.idle();
+    expect(manager.hasActiveCall("voice-agent", "chan-1")).toBe(true);
+    humansLeft?.();
+    await manager.idle();
+    expect(manager.hasActiveCall("voice-agent", "chan-1")).toBe(false);
+    expect(emitted.find((event) => event.type === "voice.room.ended")).toMatchObject({
+      source: "agent:voice-agent",
+      payload: { roomId: "room-1", reason: "humans_left" },
+    });
+  });
+
+  it("uses other agents as local barge-in signals and posts the human transcript once", async () => {
+    const sockets: FakeSocket[] = [];
+    const emitted: any[] = [];
+    const interrupted: string[] = [];
+    const onAudios: Array<(frame: { pcm: Int16Array; sampleRate: number; identity: string }) => void> = [];
+    const peer: Agent = { ...agent, name: "voice-agent-2" };
+    const manager = createRealtimeVoiceManager({
+      api: {
+        apiFetch: async (path) => {
+          if (path === "/api/voice/rooms/agent-join") {
+            return new Response(
+              JSON.stringify({
+                broker: "livekit",
+                url: "ws://127.0.0.1:7880",
+                token: "lk-token",
+                identity: "agent:peer",
+              }),
+            );
+          }
+          return new Response(JSON.stringify([]));
+        },
+        emitEvent: async (event) => {
+          emitted.push(event);
+        },
+        getPackageSecretsEnv: async () => ({ OPENAI_API_KEY: "sk-agent" }),
+        getChannelRecord: async () => ({ id: "chan-1", name: "payments" }) as any,
+      },
+      skillRoots: [],
+      connect: (url, headers) => {
+        const socket = new FakeSocket(url, headers);
+        sockets.push(socket);
+        return socket;
+      },
+      createLiveKitRoom: ({ onAudio }) => {
+        onAudios.push(onAudio);
+        return {
+          connect: async () => undefined,
+          disconnect: async () => undefined,
+          interrupt: () => interrupted.push("cleared"),
+          flush: async () => undefined,
+          publish: async () => undefined,
+        };
+      },
+    });
+    const started: Event = {
+      id: "evt-room",
+      type: "voice.room.started",
+      source: "human:alice",
+      channelId: "chan-1",
+      payload: {
+        roomId: "room-1",
+        sessionId: "session-1",
+        broker: "livekit",
+        agentNames: ["voice-agent", "voice-agent-2"],
+        startedAt: 1,
+      },
+    };
+    manager.consume(agent, [started]);
+    manager.consume(peer, [{ ...started, id: "evt-room-2" }]);
+    await manager.idle();
+    for (const socket of sockets) {
+      socket.fire("open", {});
+      socket.server({ type: "session.created" });
+      socket.server({ type: "session.updated" });
+    }
+    const pcm = new Int16Array([1, 2, 3, 4]);
+    const before = sockets[0]!.sent.length;
+    onAudios[0]!({ pcm, sampleRate: 48_000, identity: "agent:voice-agent" });
+    expect(sockets[0]!.sent).toHaveLength(before);
+    sockets[0]!.server({ type: "response.created", response: { id: "resp-active" } });
+    onAudios[0]!({ pcm, sampleRate: 48_000, identity: "agent:voice-agent-2" });
+    expect(sockets[0]!.sent.at(-2)?.type).toBe("response.cancel");
+    expect(sockets[0]!.sent.at(-1)?.type).toBe("input_audio_buffer.append");
+    expect(interrupted.length).toBeGreaterThan(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    for (const [index, socket] of sockets.entries()) {
+      onAudios[index]!({ pcm, sampleRate: 48_000, identity: "human:alice" });
+      socket.server({ type: "input_audio_buffer.speech_started" });
+      socket.server({
+        type: "conversation.item.input_audio_transcription.completed",
+        item_id: "hello",
+        transcript: "Hello there",
+      });
+    }
+    await manager.idle();
+    expect(
+      emitted.filter((event) => event.type === "message.created" && event.source === "human:alice").map((event) => event.payload.text),
+    ).toEqual(["Hello there"]);
+    await manager.endAll("test");
+  });
+
+  it("attaches LiveKit room sessions for Gemini/Liquid agents without OpenAI WebRTC", async () => {
+    const published: Array<{ pcm: Int16Array; sampleRate: number }> = [];
+    const sockets: FakeSocket[] = [];
+    const livekitJoins: string[] = [];
+    const geminiAgent: Agent = {
+      ...agent,
+      name: "gemini-agent",
+      modelId: "google:gemini-2.5-flash-native-audio-preview-09-2025",
+      modelCapabilities: { realtimeAudioInput: true, realtimeAudioOutput: true },
+    };
+    const manager = createRealtimeVoiceManager({
+      api: {
+        apiFetch: async (path, init) => {
+          if (path === "/api/voice/rooms/agent-join") {
+            livekitJoins.push(String(init?.body ?? ""));
+            return new Response(
+              JSON.stringify({
+                broker: "livekit",
+                url: "ws://127.0.0.1:7880",
+                token: "lk-token",
+                identity: "agent:gemini-agent",
+              }),
+            );
+          }
+          return new Response(JSON.stringify([]));
+        },
+        emitEvent: async () => undefined,
+        getPackageSecretsEnv: async () => ({ GOOGLE_API_KEY: "gemini-key" }),
+        getChannelRecord: async () => ({ id: "chan-1", name: "payments" }) as any,
+      },
+      skillRoots: [],
+      connect: (url, headers) => {
+        const socket = new FakeSocket(url, headers);
+        sockets.push(socket);
+        return socket;
+      },
+      createLiveKitRoom: ({ onAudio }) => ({
+        connect: async () => {
+          onAudio({ pcm: new Int16Array([1, 2]), sampleRate: 48000, identity: "human:alice" });
+        },
+        disconnect: async () => undefined,
+        interrupt: () => undefined,
+        flush: async () => undefined,
+        publish: async (pcm, sampleRate) => {
+          published.push({ pcm, sampleRate });
+        },
+      }),
+    });
+
+    manager.consume(geminiAgent, [
+      {
+        id: "evt-room",
+        type: "voice.room.started",
+        source: "human:alice",
+        channelId: "chan-1",
+        payload: {
+          roomId: "room-1",
+          sessionId: "session-1",
+          broker: "livekit",
+          agentNames: ["gemini-agent"],
+          startedAt: 1,
+        },
+      },
+    ]);
+    await manager.idle();
+    expect(livekitJoins[0]).toContain("gemini-agent");
+    expect(sockets[0]?.url).toContain("generativelanguage.googleapis.com");
+    expect(manager.hasActiveCall("gemini-agent", "chan-1")).toBe(true);
+    sockets[0]?.fire("open", {});
+    sockets[0]?.fire("message", {
+      data: JSON.stringify({
+        serverContent: {
+          modelTurn: { parts: [{ inlineData: { data: Buffer.from(new Int16Array([3]).buffer).toString("base64") } }] },
+        },
+      }),
+    });
+    await manager.idle();
+    expect(published.length).toBeGreaterThan(0);
+    await manager.endAll("test");
+    expect(manager.hasActiveCall("gemini-agent", "chan-1")).toBe(false);
+  });
+
+  it("does not hang up a LiveKit room when a different room ends", async () => {
+    const published: Array<{ pcm: Int16Array; sampleRate: number }> = [];
+    const sockets: FakeSocket[] = [];
+    const geminiAgent: Agent = {
+      ...agent,
+      name: "gemini-agent",
+      modelId: "google:gemini-2.5-flash-native-audio-preview-09-2025",
+      modelCapabilities: { realtimeAudioInput: true, realtimeAudioOutput: true },
+    };
+    const manager = createRealtimeVoiceManager({
+      api: {
+        apiFetch: async (path) => {
+          if (path === "/api/voice/rooms/agent-join") {
+            return new Response(
+              JSON.stringify({
+                broker: "livekit",
+                url: "ws://127.0.0.1:7880",
+                token: "lk-token",
+                identity: "agent:gemini-agent",
+              }),
+            );
+          }
+          return new Response(JSON.stringify([]));
+        },
+        emitEvent: async () => undefined,
+        getPackageSecretsEnv: async () => ({ GOOGLE_API_KEY: "gemini-key" }),
+        getChannelRecord: async () => ({ id: "chan-1", name: "payments" }) as any,
+      },
+      skillRoots: [],
+      connect: (url, headers) => {
+        const socket = new FakeSocket(url, headers);
+        sockets.push(socket);
+        return socket;
+      },
+      createLiveKitRoom: () => ({
+        connect: async () => undefined,
+        disconnect: async () => undefined,
+        interrupt: () => undefined,
+        flush: async () => undefined,
+        publish: async (pcm, sampleRate) => {
+          published.push({ pcm, sampleRate });
+        },
+      }),
+    });
+
+    manager.consume(geminiAgent, [
+      {
+        id: "evt-room",
+        type: "voice.room.started",
+        source: "human:alice",
+        channelId: "chan-1",
+        payload: {
+          roomId: "room-keep",
+          sessionId: "session-1",
+          broker: "livekit",
+          agentNames: ["gemini-agent"],
+          startedAt: 1,
+        },
+      },
+    ]);
+    await manager.idle();
+    expect(manager.hasActiveCall("gemini-agent", "chan-1")).toBe(true);
+
+    manager.consume(geminiAgent, [
+      {
+        id: "evt-other-end",
+        type: "voice.room.ended",
+        source: "human:alice",
+        channelId: "chan-1",
+        payload: { roomId: "room-other", reason: "rejoined" },
+      },
+    ]);
+    await manager.idle();
+    expect(manager.hasActiveCall("gemini-agent", "chan-1")).toBe(true);
+
+    manager.consume(geminiAgent, [
+      {
+        id: "evt-end",
+        type: "voice.room.ended",
+        source: "human:alice",
+        channelId: "chan-1",
+        payload: { roomId: "room-keep", reason: "left" },
+      },
+    ]);
+    await manager.idle();
+    expect(manager.hasActiveCall("gemini-agent", "chan-1")).toBe(false);
+  });
+
+  it("requests a realtime response after VAD speech_stopped", async () => {
+    const sockets: FakeSocket[] = [];
+    let onAudio: ((frame: { pcm: Int16Array; sampleRate: number; identity: string }) => void) | undefined;
+    const manager = createRealtimeVoiceManager({
+      api: {
+        apiFetch: async (path) => {
+          if (path === "/api/voice/rooms/agent-join") {
+            return new Response(
+              JSON.stringify({
+                broker: "livekit",
+                url: "ws://127.0.0.1:7880",
+                token: "lk-token",
+                identity: "agent:voice-agent",
+              }),
+            );
+          }
+          return new Response(JSON.stringify([]));
+        },
+        emitEvent: async () => undefined,
+        getPackageSecretsEnv: async () => ({ OPENAI_API_KEY: "sk-agent" }),
+        getChannelRecord: async () => ({ id: "chan-1", name: "payments" }) as any,
+      },
+      skillRoots: [],
+      connect: (url, headers) => {
+        const socket = new FakeSocket(url, headers);
+        sockets.push(socket);
+        return socket;
+      },
+      createLiveKitRoom: (input) => {
+        onAudio = input.onAudio;
+        return {
+          connect: async () => undefined,
+          disconnect: async () => undefined,
+          interrupt: () => undefined,
+          flush: async () => undefined,
+          publish: async () => undefined,
+        };
+      },
+    });
+    manager.consume(agent, [
+      {
+        id: "evt-room",
+        type: "voice.room.started",
+        source: "human:alice",
+        channelId: "chan-1",
+        payload: {
+          roomId: "room-1",
+          sessionId: "session-1",
+          broker: "livekit",
+          agentNames: ["voice-agent"],
+          startedAt: 1,
+        },
+      },
+    ]);
+    await manager.idle();
+    const socket = sockets[0]!;
+    socket.fire("open", {});
+    socket.server({ type: "session.created" });
+    socket.server({ type: "session.updated" });
+    onAudio?.({ pcm: new Int16Array([1, 2, 3, 4]), sampleRate: 48_000, identity: "human:alice" });
+    socket.server({ type: "input_audio_buffer.speech_started" });
+    socket.server({ type: "input_audio_buffer.speech_stopped" });
+    socket.server({
+      type: "conversation.item.input_audio_transcription.completed",
+      item_id: "hello",
+      transcript: "Hello",
+    });
+    await manager.idle();
+    expect(socket.sent.filter((message) => message.type === "response.create")).toEqual([
+      { type: "response.create" },
+    ]);
+    await manager.endAll("test");
+  });
+
+  it("defers a pending human response while another agent is talking", async () => {
+    const previousStagger = process.env.ORGOPS_REALTIME_RESPONSE_STAGGER_MS;
+    process.env.ORGOPS_REALTIME_RESPONSE_STAGGER_MS = "40";
+    const sockets: FakeSocket[] = [];
+    const onAudios: Array<(frame: { pcm: Int16Array; sampleRate: number; identity: string }) => void> = [];
+    const peer: Agent = { ...agent, name: "voice-agent-2" };
+    const manager = createRealtimeVoiceManager({
+      api: {
+        apiFetch: async (path) => {
+          if (path === "/api/voice/rooms/agent-join") {
+            return new Response(
+              JSON.stringify({
+                broker: "livekit",
+                url: "ws://127.0.0.1:7880",
+                token: "lk-token",
+                identity: "agent:peer",
+              }),
+            );
+          }
+          return new Response(JSON.stringify([]));
+        },
+        emitEvent: async () => undefined,
+        getPackageSecretsEnv: async () => ({ OPENAI_API_KEY: "sk-agent" }),
+        getChannelRecord: async () => ({ id: "chan-1", name: "payments" }) as any,
+      },
+      skillRoots: [],
+      connect: (url, headers) => {
+        const socket = new FakeSocket(url, headers);
+        sockets.push(socket);
+        return socket;
+      },
+      createLiveKitRoom: ({ onAudio }) => {
+        onAudios.push(onAudio);
+        return {
+          connect: async () => undefined,
+          disconnect: async () => undefined,
+          interrupt: () => undefined,
+          flush: async () => undefined,
+          publish: async () => undefined,
+        };
+      },
+    });
+    try {
+      const started: Event = {
+        id: "evt-room",
+        type: "voice.room.started",
+        source: "human:alice",
+        channelId: "chan-1",
+        payload: {
+          roomId: "room-1",
+          sessionId: "session-1",
+          broker: "livekit",
+          agentNames: ["voice-agent", "voice-agent-2"],
+          startedAt: 1,
+        },
+      };
+      manager.consume(agent, [started]);
+      manager.consume(peer, [{ ...started, id: "evt-room-2" }]);
+      await manager.idle();
+      for (const socket of sockets) {
+        socket.fire("open", {});
+        socket.server({ type: "session.created" });
+        socket.server({ type: "session.updated" });
+      }
+      onAudios[1]!({ pcm: new Int16Array([9, 10, 11, 12]), sampleRate: 48_000, identity: "human:alice" });
+      sockets[1]!.server({ type: "input_audio_buffer.speech_started" });
+      sockets[1]!.server({ type: "input_audio_buffer.speech_stopped" });
+      sockets[1]!.server({
+        type: "conversation.item.input_audio_transcription.completed",
+        item_id: "hello-2",
+        transcript: "voice agent 2 what do you think?",
+      });
+      onAudios[1]!({ pcm: new Int16Array([1, 2, 3, 4]), sampleRate: 48_000, identity: "agent:voice-agent" });
+      onAudios[0]!({ pcm: new Int16Array([9, 10, 11, 12]), sampleRate: 48_000, identity: "human:alice" });
+      sockets[0]!.server({ type: "input_audio_buffer.speech_started" });
+      sockets[0]!.server({ type: "input_audio_buffer.speech_stopped" });
+      sockets[0]!.server({
+        type: "conversation.item.input_audio_transcription.completed",
+        item_id: "hello-1",
+        transcript: "voice agent 2 what do you think?",
+      });
+      await manager.idle();
+      expect(sockets[1]!.sent.some((message) => message.type === "input_audio_buffer.append")).toBe(true);
+      expect(sockets[1]!.sent.filter((message) => message.type === "response.create")).toEqual([
+        { type: "response.create" },
+      ]);
+      expect(sockets[0]!.sent.filter((message) => message.type === "response.create")).toEqual([]);
+
+      onAudios[1]!({ pcm: new Int16Array([5, 6, 7, 8]), sampleRate: 48_000, identity: "human:alice" });
+      expect(sockets[1]!.sent.at(-1)?.type).toBe("input_audio_buffer.append");
+      sockets[1]!.server({ type: "input_audio_buffer.speech_started" });
+      sockets[1]!.server({ type: "input_audio_buffer.speech_stopped" });
+      sockets[1]!.server({
+        type: "conversation.item.input_audio_transcription.completed",
+        item_id: "hello-3",
+        transcript: "And now?",
+      });
+      await manager.idle();
+      expect(sockets[1]!.sent.filter((message) => message.type === "response.create")).toEqual([
+        { type: "response.create" },
+        { type: "response.create" },
+      ]);
+    } finally {
+      if (previousStagger === undefined) delete process.env.ORGOPS_REALTIME_RESPONSE_STAGGER_MS;
+      else process.env.ORGOPS_REALTIME_RESPONSE_STAGGER_MS = previousStagger;
+      await manager.endAll("test");
+    }
   });
 });
