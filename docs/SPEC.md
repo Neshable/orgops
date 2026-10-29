@@ -1011,3 +1011,17 @@ reply with speech: `skills/speak/assets/speak.ts` calls OpenAI text-to-speech
 `marin`) with the agent's injected `OPENAI_API_KEY`, the agent uploads the file
 with `fs_upload`, and posts it with the spoken text. The skill tells agents to
 answer in voice when the human's message carries `payload.voice`.
+
+### Byte-bounded event listing and delivery
+
+Normal event listings load metadata before payloads, allow at most 64 KiB per
+inline payload and 1 MiB of UTF-8 payloads per page. Runner receipt polls allow
+complete inputs up to 1 MiB, including file-backed payloads, and acknowledge only
+the prefix that fits. Later inputs stay pending; an omitted individual payload
+cannot trigger work or broaden target selection. Historical DB/file content stays
+unchanged. File payloads are read into bounded buffers; the existing payload
+chunk endpoint, references, single-event/scheduled-event responses, voice events
+and explicit SQLite export remain available. Invalid/negative page limits fall
+back to 100 rather than uncapping SQL reads. Successful void tool results remain
+successful while persisted output is bounded. This forwards the deployed #78
+recovery protections onto the current voice/blob-storage implementation.

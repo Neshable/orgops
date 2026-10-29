@@ -4,7 +4,7 @@ import type { SkillMeta, SkillRoot } from "@orgops/skills";
 import type { EventShapeDefinition } from "@orgops/schemas";
 import { decryptSecret, encryptSecret, parseMasterKey } from "@orgops/crypto";
 import { z } from "zod";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, openSync, closeSync, fstatSync, readSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -32,6 +32,8 @@ import type { AccessControl, RequestUser } from "./access";
 // AND the coder's own event posts. Dashboards wanting totals should call
 // GET /api/events/stats; complete dumps go through /api/events/export.sqlite.
 const MAX_EVENT_ROWS = 10_000;
+const MAX_EVENT_PAYLOAD_BYTES = 64 * 1024;
+const MAX_EVENT_PAGE_PAYLOAD_BYTES = 1024 * 1024;
 const MAX_EVENT_PAYLOAD_JSON_CHARS = 262_144;
 
 type EventsDeps = {
@@ -254,6 +256,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
     const params = new URL(url).searchParams;
     const scheduled = params.get("scheduled");
     const includeConsumed = params.get("includeConsumed");
+    const requestedLimit = Number(params.get("limit") ?? 100);
     return {
       params,
       channelId: params.get("channelId"),
@@ -267,7 +270,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
       after: params.get("after"),
       before: params.get("before"),
       hasExplicitLimit: params.has("limit"),
-      limit: Math.min(Number(params.get("limit") ?? 100), MAX_EVENT_ROWS),
+      limit: Number.isFinite(requestedLimit) && requestedLimit >= 1 ? Math.min(Math.floor(requestedLimit), MAX_EVENT_ROWS) : 100,
       order: params.get("order"),
       descending: params.get("order") === "desc",
       all: params.get("all") === "1",
@@ -298,7 +301,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
     };
   }
 
-  function eventRowSelectFields(options: { truncatePayload: boolean }) {
+  function eventRowSelectFields(options: { truncatePayload: boolean; metadataOnly?: boolean }) {
     const blobCharLength = sql<number | null>`(SELECT ${schema.eventPayloadBlobs.char_length} FROM ${schema.eventPayloadBlobs} WHERE ${schema.eventPayloadBlobs.event_id} = ${schema.events.id})`;
     const blobByteLength = sql<number | null>`(SELECT ${schema.eventPayloadBlobs.byte_length} FROM ${schema.eventPayloadBlobs} WHERE ${schema.eventPayloadBlobs.event_id} = ${schema.events.id})`;
     const blobSha256 = sql<string | null>`(SELECT ${schema.eventPayloadBlobs.sha256} FROM ${schema.eventPayloadBlobs} WHERE ${schema.eventPayloadBlobs.event_id} = ${schema.events.id})`;
@@ -306,9 +309,10 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
     return {
       id: schema.events.id,
       type: schema.events.type,
-      payload_json: options.truncatePayload
+      payload_json: options.metadataOnly ? sql<string>`''` : options.truncatePayload
         ? sql<string | null>`CASE WHEN length(${schema.events.payload_json}) > ${MAX_EVENT_PAYLOAD_JSON_CHARS} THEN NULL ELSE ${schema.events.payload_json} END`
         : schema.events.payload_json,
+      payload_bytes: sql<number>`COALESCE(${blobByteLength}, octet_length(${schema.events.payload_json}))`,
       payload_json_chars: sql<number>`COALESCE(${blobCharLength}, length(${schema.events.payload_json}))`,
       payload_blob_storage_path: blobStoragePath,
       payload_blob_byte_length: blobByteLength,
@@ -319,10 +323,38 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
       deliver_at: schema.events.deliver_at,
       status: schema.events.status,
       fail_count: schema.events.fail_count,
-      last_error: schema.events.last_error,
+      last_error: sql<string | null>`substr(${schema.events.last_error}, 1, 2048)`,
       idempotency_key: schema.events.idempotency_key,
       created_at: schema.events.created_at,
     };
+  }
+
+  function hydrateEventRows(rows: any[], payloadLimit = MAX_EVENT_PAYLOAD_BYTES): any[] {
+    let remaining = MAX_EVENT_PAGE_PAYLOAD_BYTES;
+    return rows.map(row => {
+      const bytes = Number(row.payload_bytes);
+      if (!Number.isFinite(bytes) || bytes > payloadLimit || bytes > remaining) return {...row, payload_truncated: true};
+      let payload: string;
+      if (row.payload_blob_storage_path) {
+        // Read only the declared bounded file, never an unbounded historical blob.
+        const fd = openSync(resolveBlobPath(row.payload_blob_storage_path), 'r');
+        try {
+          if (fstatSync(fd).size !== bytes) throw new Error('Event payload blob size changed');
+          const buffer = Buffer.alloc(bytes);
+          let offset = 0;
+          while (offset < bytes) {
+            const count = readSync(fd, buffer, offset, bytes - offset, offset);
+            if (!count) throw new Error('Event payload blob is incomplete');
+            offset += count;
+          }
+          payload = buffer.toString('utf8');
+        } finally {closeSync(fd);}
+      } else {
+        payload = orm.select({json:schema.events.payload_json}).from(schema.events).where(eq(schema.events.id,row.id)).get()!.json;
+      }
+      remaining -= bytes;
+      return {...row, payload_json:payload, payload_max_chars:payloadLimit};
+    });
   }
 
   function parseChunkQuery(url: string) {
@@ -387,7 +419,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
       : all && !hasExplicitLimit
         ? MAX_EVENT_ROWS
         : limit;
-    const selectFields = eventRowSelectFields({ truncatePayload: !options.includeAll });
+    const selectFields = eventRowSelectFields({ truncatePayload: !options.includeAll, metadataOnly: !options.includeAll });
 
     const whereClauses: any[] = [];
 
@@ -492,12 +524,26 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
               ? desc(schema.events.created_at)
               : asc(schema.events.created_at),
           );
-        const joinedRows = (
+        let joinedRows = (
           rowCap === null ? joinedQuery : joinedQuery.limit(rowCap)
         ).all() as Array<{
           event: any;
           receiptStatus: string;
         }>;
+
+        if (!options.includeAll) {
+          let remaining = MAX_EVENT_PAGE_PAYLOAD_BYTES;
+          let count = 0;
+          for (const row of joinedRows) {
+            const bytes = row.event.payload_bytes;
+            if (bytes <= MAX_EVENT_PAGE_PAYLOAD_BYTES) {
+              if (bytes > remaining) break;
+              remaining -= bytes;
+            }
+            count += 1;
+          }
+          joinedRows = joinedRows.slice(0,count);
+        }
 
         if (options.markRunnerDelivered && !scheduledOnly) {
           const pendingDeliveredIds = joinedRows
@@ -542,7 +588,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
                   .where(eq(schema.events.id, eventId))
                   .get() as any | undefined;
                 if (updated) {
-                  publishEventRow(updated);
+                  publishEventRow(hydrateEventRows([updated])[0]);
                 }
               }
             }
@@ -1318,7 +1364,8 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
       includeAll: false,
       markRunnerDelivered: true,
     });
-    return jsonResponse(c, rows.map(eventRowToApi));
+    const pollingRunner = user?.username === "runner" && Boolean(query.agentName);
+    return jsonResponse(c, hydrateEventRows(rows, pollingRunner ? MAX_EVENT_PAGE_PAYLOAD_BYTES : MAX_EVENT_PAYLOAD_BYTES).map(eventRowToApi));
   });
 
   app.delete("/api/events", (c) => {
