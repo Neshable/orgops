@@ -2360,6 +2360,32 @@ button {
   align-self: end;
 }
 
+.composer-primary-actions,
+.composer-voice-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.composer-voice-disclosure {
+  display: grid;
+  gap: 8px;
+}
+
+.composer .composer-voice-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.composer-voice-toggle svg {
+  transition: transform 0.16s ease;
+}
+
+.composer-voice-disclosure.is-expanded .composer-voice-toggle svg {
+  transform: rotate(180deg);
+}
+
 .composer button {
   padding: 13px 22px;
 }

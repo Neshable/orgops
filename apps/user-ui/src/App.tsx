@@ -528,6 +528,7 @@ function participantAgentStatus(participant: ChannelParticipant, agents: Agent[]
 const COMPOSER_MIN_HEIGHT = 56;
 const COMPOSER_MAX_VIEWPORT_SHARE = 0.6;
 const COMPOSER_HEIGHT_STORAGE_KEY = "orgops.user-ui.composerHeight";
+const VOICE_CONTROLS_STORAGE_KEY = "orgops.user-ui.voiceControlsExpanded";
 
 function readStoredComposerHeight(): number | null {
   try {
@@ -535,6 +536,22 @@ function readStoredComposerHeight(): number | null {
     return Number.isFinite(stored) && stored >= COMPOSER_MIN_HEIGHT ? stored : null;
   } catch {
     return null;
+  }
+}
+
+function readStoredVoiceControlsExpanded() {
+  try {
+    return window.localStorage.getItem(VOICE_CONTROLS_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredVoiceControlsExpanded(expanded: boolean) {
+  try {
+    window.localStorage.setItem(VOICE_CONTROLS_STORAGE_KEY, expanded ? "true" : "false");
+  } catch {
+    // Voice controls are still usable if local storage is unavailable.
   }
 }
 
@@ -1061,6 +1078,7 @@ export default function App() {
   const [archiveDraft, setArchiveDraft] = useState(false);
   const [expandedTraceEventId, setExpandedTraceEventId] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const [voiceControlsExpanded, setVoiceControlsExpanded] = useState(readStoredVoiceControlsExpanded);
   const [recordingVoice, setRecordingVoice] = useState(false);
   const [voiceHint, setVoiceHint] = useState<string | null>(null);
   const [voiceConfig, setVoiceConfig] = useState<VoiceConfig | null>(null);
@@ -1341,6 +1359,16 @@ export default function App() {
     sending ||
     recordingVoice ||
     liveVoiceStarting;
+  const hasVoiceControls =
+    !liveVoiceSessionId &&
+    (canStartVoiceRoom ||
+      (canStartDirectVoice && Boolean(directVoiceCallTarget)) ||
+      canSendVoiceMessage ||
+      voiceCapableAgentNames.length > 0);
+  const voiceControlCount =
+    (canStartVoiceRoom && !liveVoiceSessionId ? 1 : 0) +
+    (canStartDirectVoice && directVoiceCallTarget && !liveVoiceSessionId ? 1 : 0) +
+    (!liveVoiceSessionId && (canSendVoiceMessage || voiceCapableAgentNames.length > 0) ? 1 : 0);
   const canStartConversation =
     Boolean(conversationName.trim()) || selectedConversationAgents.length === 1 || selectedConversationTeams.length > 0;
   const selectedConversationAgentRecords = useMemo(
@@ -4568,154 +4596,180 @@ export default function App() {
             rows={isConversationEmpty ? 1 : 3}
           />
           <div className="composer-actions">
-            {canStartVoiceRoom && !liveVoiceSessionId ? (
-              <div className="composer-call">
-                <button
-                  type="button"
-                  className="composer-secondary composer-live-voice"
-                  disabled={liveVoiceCallDisabled}
-                  title="Join a realtime channel voice room. Agent audio is mixed locally and transcribed into the channel."
-                  onClick={() => void startLiveVoice("room")}
-                >
-                  {liveVoiceStarting ? "Connecting..." : `Join voice room (${roomAgentNames.length})`}
-                </button>
-              </div>
-            ) : null}
-            {canStartDirectVoice && directVoiceCallTarget && !liveVoiceSessionId ? (
-              <div className="composer-call" ref={directVoiceMenuRef}>
-                <button
-                  type="button"
-                  className="composer-secondary composer-live-voice"
-                  disabled={liveVoiceCallDisabled}
-                  title={`Start a direct realtime voice call with ${directVoiceCallTarget}.`}
-                  onClick={() => void startLiveVoice("direct")}
-                >
-                  {liveVoiceStarting ? "Connecting..." : `Call ${directVoiceCallTarget}`}
-                </button>
-                {directAgentNames.length > 1 ? (
-                  <>
-                    <button
-                      type="button"
-                      className="composer-secondary composer-call-toggle"
-                      aria-label="Choose direct call agent"
-                      aria-haspopup="menu"
-                      aria-expanded={directVoiceMenuOpen}
-                      disabled={liveVoiceCallDisabled}
-                      onClick={() => setDirectVoiceMenuOpen((open) => !open)}
-                    >
-                      <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
-                        <path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </button>
-                    {directVoiceMenuOpen ? (
-                      <div className="composer-call-menu" role="menu" aria-label="Agent for direct call">
-                        <p className="composer-call-menu-title">Direct call with</p>
-                        {directAgentNames.map((name) => (
-                          <button
-                            type="button"
-                            role="menuitemradio"
-                            aria-checked={name === directVoiceCallTarget}
-                            className={`composer-call-option${name === directVoiceCallTarget ? " is-selected" : ""}`}
-                            key={name}
-                            onClick={() => {
-                              setDirectVoiceTargetAgent(name);
-                              setDirectVoiceMenuOpen(false);
-                            }}
-                          >
-                            <span>{name}</span>
-                            {name === directVoiceCallTarget ? <span aria-hidden="true">✓</span> : null}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </>
-                ) : null}
-              </div>
-            ) : null}
-            {!liveVoiceSessionId && (canSendVoiceMessage || voiceCapableAgentNames.length > 0) ? (
+            <div className="composer-primary-actions">
               <button
                 type="button"
-                className={`composer-secondary composer-voice${recordingVoice ? " is-recording" : ""}`}
-                aria-pressed={recordingVoice}
+                className="composer-secondary"
+                disabled={!activeChannel || Boolean(activeChannel.archivedAt) || !activeChannelCanPost || sending}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                Attach files
+              </button>
+              <button
                 disabled={
-                  !canSendVoiceMessage ||
                   !activeChannel ||
                   Boolean(activeChannel.archivedAt) ||
                   !activeChannelCanPost ||
                   sending ||
-                  Boolean(liveVoiceSessionId)
+                  recordingVoice ||
+                  uploadingAttachmentCount > 0 ||
+                  (!draftHasText && readyAttachments.length === 0)
                 }
-                title={
-                  !canSendVoiceMessage
-                    ? "Voice messages need a transcription model. Set ORGOPS_TRANSCRIPTION_MODEL or add a Mistral/OpenAI API key."
-                    : "Hold to record (or hold Space). Release to send, Esc to cancel. Voice is transcribed for everyone in the channel."
-                }
-                onPointerDown={(event) => {
-                  if (event.button !== 0) return;
-                  event.preventDefault();
-                  try {
-                    event.currentTarget.setPointerCapture(event.pointerId);
-                  } catch {
-                    // Pointer already released; recording still stops on pointerup.
-                  }
-                  void startVoiceRecording();
-                }}
-                onPointerUp={(event) => {
-                  event.preventDefault();
-                  stopVoiceRecording();
-                }}
-                onPointerCancel={() => stopVoiceRecording(true)}
-                onKeyDown={(event) => {
-                  if ((event.key === " " || event.key === "Enter") && !event.repeat) {
-                    event.preventDefault();
-                    void startVoiceRecording();
-                  }
-                }}
-                onKeyUp={(event) => {
-                  if (event.key === " " || event.key === "Enter") {
-                    event.preventDefault();
-                    stopVoiceRecording();
-                  }
-                }}
-                onContextMenu={(event) => event.preventDefault()}
               >
-                <span className="composer-voice-state" aria-hidden={recordingVoice}>
-                  Hold to talk
-                </span>
-                <span className="composer-voice-state composer-voice-recording" aria-hidden={!recordingVoice}>
-                  <span className="voice-level" ref={voiceLevelRef} aria-hidden="true">
-                    <span />
-                  </span>
-                  <span ref={voiceElapsedRef}>0:00</span>
-                  <span>Release to send</span>
-                </span>
+                {uploadingAttachmentCount > 0
+                  ? `Uploading ${uploadingAttachmentCount}...`
+                  : sending
+                    ? "Sending..."
+                    : "Send"}
               </button>
+            </div>
+            {hasVoiceControls ? (
+              <div className={`composer-voice-disclosure${voiceControlsExpanded ? " is-expanded" : ""}`}>
+                <button
+                  type="button"
+                  className="composer-secondary composer-voice-toggle"
+                  aria-expanded={voiceControlsExpanded}
+                  aria-controls="composer-voice-actions"
+                  onClick={() => {
+                    const expanded = !voiceControlsExpanded;
+                    setVoiceControlsExpanded(expanded);
+                    writeStoredVoiceControlsExpanded(expanded);
+                  }}
+                >
+                  <span>{voiceControlsExpanded ? "Hide voice" : `Voice (${voiceControlCount})`}</span>
+                  <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+                    <path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+                {voiceControlsExpanded ? (
+                  <div id="composer-voice-actions" className="composer-voice-actions">
+                    {canStartVoiceRoom && !liveVoiceSessionId ? (
+                      <div className="composer-call">
+                        <button
+                          type="button"
+                          className="composer-secondary composer-live-voice"
+                          disabled={liveVoiceCallDisabled}
+                          title="Join a realtime channel voice room. Agent audio is mixed locally and transcribed into the channel."
+                          onClick={() => void startLiveVoice("room")}
+                        >
+                          {liveVoiceStarting ? "Connecting..." : `Join voice room (${roomAgentNames.length})`}
+                        </button>
+                      </div>
+                    ) : null}
+                    {canStartDirectVoice && directVoiceCallTarget && !liveVoiceSessionId ? (
+                      <div className="composer-call" ref={directVoiceMenuRef}>
+                        <button
+                          type="button"
+                          className="composer-secondary composer-live-voice"
+                          disabled={liveVoiceCallDisabled}
+                          title={`Start a direct realtime voice call with ${directVoiceCallTarget}.`}
+                          onClick={() => void startLiveVoice("direct")}
+                        >
+                          {liveVoiceStarting ? "Connecting..." : `Call ${directVoiceCallTarget}`}
+                        </button>
+                        {directAgentNames.length > 1 ? (
+                          <>
+                            <button
+                              type="button"
+                              className="composer-secondary composer-call-toggle"
+                              aria-label="Choose direct call agent"
+                              aria-haspopup="menu"
+                              aria-expanded={directVoiceMenuOpen}
+                              disabled={liveVoiceCallDisabled}
+                              onClick={() => setDirectVoiceMenuOpen((open) => !open)}
+                            >
+                              <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+                                <path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                              </svg>
+                            </button>
+                            {directVoiceMenuOpen ? (
+                              <div className="composer-call-menu" role="menu" aria-label="Agent for direct call">
+                                <p className="composer-call-menu-title">Direct call with</p>
+                                {directAgentNames.map((name) => (
+                                  <button
+                                    type="button"
+                                    role="menuitemradio"
+                                    aria-checked={name === directVoiceCallTarget}
+                                    className={`composer-call-option${name === directVoiceCallTarget ? " is-selected" : ""}`}
+                                    key={name}
+                                    onClick={() => {
+                                      setDirectVoiceTargetAgent(name);
+                                      setDirectVoiceMenuOpen(false);
+                                    }}
+                                  >
+                                    <span>{name}</span>
+                                    {name === directVoiceCallTarget ? <span aria-hidden="true">✓</span> : null}
+                                  </button>
+                                ))}
+                              </div>
+                            ) : null}
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {!liveVoiceSessionId && (canSendVoiceMessage || voiceCapableAgentNames.length > 0) ? (
+                      <button
+                        type="button"
+                        className={`composer-secondary composer-voice${recordingVoice ? " is-recording" : ""}`}
+                        aria-pressed={recordingVoice}
+                        disabled={
+                          !canSendVoiceMessage ||
+                          !activeChannel ||
+                          Boolean(activeChannel.archivedAt) ||
+                          !activeChannelCanPost ||
+                          sending ||
+                          Boolean(liveVoiceSessionId)
+                        }
+                        title={
+                          !canSendVoiceMessage
+                            ? "Voice messages need a transcription model. Set ORGOPS_TRANSCRIPTION_MODEL or add a Mistral/OpenAI API key."
+                            : "Hold to record (or hold Space). Release to send, Esc to cancel. Voice is transcribed for everyone in the channel."
+                        }
+                        onPointerDown={(event) => {
+                          if (event.button !== 0) return;
+                          event.preventDefault();
+                          try {
+                            event.currentTarget.setPointerCapture(event.pointerId);
+                          } catch {
+                            // Pointer already released; recording still stops on pointerup.
+                          }
+                          void startVoiceRecording();
+                        }}
+                        onPointerUp={(event) => {
+                          event.preventDefault();
+                          stopVoiceRecording();
+                        }}
+                        onPointerCancel={() => stopVoiceRecording(true)}
+                        onKeyDown={(event) => {
+                          if ((event.key === " " || event.key === "Enter") && !event.repeat) {
+                            event.preventDefault();
+                            void startVoiceRecording();
+                          }
+                        }}
+                        onKeyUp={(event) => {
+                          if (event.key === " " || event.key === "Enter") {
+                            event.preventDefault();
+                            stopVoiceRecording();
+                          }
+                        }}
+                        onContextMenu={(event) => event.preventDefault()}
+                      >
+                        <span className="composer-voice-state" aria-hidden={recordingVoice}>
+                          Hold to talk
+                        </span>
+                        <span className="composer-voice-state composer-voice-recording" aria-hidden={!recordingVoice}>
+                          <span className="voice-level" ref={voiceLevelRef} aria-hidden="true">
+                            <span />
+                          </span>
+                          <span ref={voiceElapsedRef}>0:00</span>
+                          <span>Release to send</span>
+                        </span>
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
             ) : null}
-            <button
-              type="button"
-              className="composer-secondary"
-              disabled={!activeChannel || Boolean(activeChannel.archivedAt) || !activeChannelCanPost || sending}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              Attach files
-            </button>
-            <button
-              disabled={
-                !activeChannel ||
-                Boolean(activeChannel.archivedAt) ||
-                !activeChannelCanPost ||
-                sending ||
-                recordingVoice ||
-                uploadingAttachmentCount > 0 ||
-                (!draftHasText && readyAttachments.length === 0)
-              }
-            >
-              {uploadingAttachmentCount > 0
-                ? `Uploading ${uploadingAttachmentCount}...`
-                : sending
-                  ? "Sending..."
-                  : "Send"}
-            </button>
           </div>
           {hasAttachmentErrors ? (
             <p className="composer-attachment-error">
