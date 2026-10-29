@@ -113,3 +113,24 @@ Auth has two paths: human session cookie (`orgops_session`, in-memory `sessions`
 - Conventional commits (`feat:`, `fix:`, `chore:`, `docs:`, with a scope), as in existing history.
 - `CHANGELOG.md` is intentionally not maintained by hand; release notes are generated per release tag by CI.
 - Runtime state lives in gitignored `.orgops-data/` (SQLite, workspaces, souls) and `files/` (uploads).
+
+## Pull request descriptions
+
+Apply this guidance to new PRs; do not rewrite existing PR descriptions solely to
+retrofit it.
+
+- Lead with the intent: the concrete problem and the resulting behavior. Explain
+  what changed and why, so a reviewer can compare the implementation with that
+  intent without reading the conversation.
+- Check the existing API, event contracts and repository boundaries before
+  proposing a change. Describe the final implementation, not abandoned plans.
+- Keep descriptions proportional to the change. A small PR can use a few
+  sentences and validation; larger PRs can use What, Why and Validation sections.
+  Avoid repeating the same explanation under multiple headings.
+- Report actual validation commands and results, including relevant failures and
+  checks not run. Distinguish required dependencies from optional follow-ups;
+  state deployment status when relevant. Do not claim checks or deployment that
+  have not happened.
+- Use [#51](https://github.com/camplight/orgops/pull/51) as a small-PR example and
+  [#76](https://github.com/camplight/orgops/pull/76) as a larger-PR example. Follow
+  their level of useful detail, not a mandatory template.

@@ -258,6 +258,18 @@ Validation is dynamic and composed from:
 
 ## Auth and Access
 
+Instance-level administration uses the existing bootstrap-owner policy: the human
+with the earliest `(created_at,id)` (also used for Google sign-in settings), or a
+global runner credential. Scoped runner credentials are not instance administrators.
+Inviting accounts, resetting temporary passwords, runner bootstrap credentials and
+runner invites, and bulk event deletion require this authority. Channel message
+clearing requires channel management, not merely posting access. Temporary password
+generation uses cryptographic randomness and a reset revokes that human's active
+sessions. Runner bootstrap credentials and runner bootstrap invites are exposed
+only to the bootstrap-owner human; runner credentials, including global runners,
+cannot fetch or mint them. This does not introduce a general role-management API
+or an OS sandbox.
+
 ### Human Auth
 
 - Session-cookie login: `POST /api/auth/login`
@@ -269,6 +281,13 @@ Validation is dynamic and composed from:
   `agentParticipants[]`; the invited human is subscribed to the landing channel.
 
 ### Channel Visibility Rules
+
+WebSocket resource authorization is rechecked on every delivery, including org-wide
+event subscriptions, agent/process topics, delayed events and existing sockets
+after membership revocation. Unknown topics are refused. Org-wide refresh notices
+omit private resource metadata for non-administrators. Uploaded active content
+is served as an attachment with an inert MIME, `nosniff` and sandbox CSP; only
+PNG/JPEG/GIF/WebP/AVIF retain inline image previews.
 
 - `PUBLIC` channels are visible to all authenticated humans.
 - `PRIVATE` channels are visible to:
@@ -674,8 +693,8 @@ Presence events (bookkeeping only):
 ### Runners
 
 - `GET /api/runners`
-- `GET /api/runners/setup-config` (authenticated human users)
-- `POST /api/runners/invites` (authenticated human users; creates scoped runner bootstrap invite)
+- `GET /api/runners/setup-config` (bootstrap-owner human only)
+- `POST /api/runners/invites` (bootstrap-owner human only; creates scoped runner bootstrap invite)
 - `GET /api/runners/invites/:token` (public invite bootstrap payload for opscli)
 - `POST /api/runners/register` (runner auth; register/re-register)
 - `PATCH /api/runners/:id` (authenticated human users; rename runner display name)
@@ -1031,3 +1050,17 @@ must not automatically replay interrupted requests. Existing lifecycle and turn
 events are unchanged; no synthetic successful outcomes or receipt rewrites are
 introduced. Agent visibility/scoped-runner access checks apply to this metadata,
 and lifecycle-channel contents are not included in agent responses.
+
+### Byte-bounded event listing and delivery
+
+Normal event listings load metadata before payloads, allow at most 64 KiB per
+inline payload and 1 MiB of UTF-8 payloads per page. Runner receipt polls allow
+complete inputs up to 1 MiB, including file-backed payloads, and acknowledge only
+the prefix that fits. Later inputs stay pending; an omitted individual payload
+cannot trigger work or broaden target selection. Historical DB/file content stays
+unchanged. File payloads are read into bounded buffers; the existing payload
+chunk endpoint, references, single-event/scheduled-event responses, voice events
+and explicit SQLite export remain available. Invalid/negative page limits fall
+back to 100 rather than uncapping SQL reads. Successful void tool results remain
+successful while persisted output is bounded. This forwards the deployed #78
+recovery protections onto the current voice/blob-storage implementation.

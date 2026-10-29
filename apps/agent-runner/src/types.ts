@@ -28,6 +28,7 @@ export type Agent = {
 };
 
 export type Event = {
+  payloadTruncated?: boolean;
   id: string;
   type: string;
   payload: unknown;
