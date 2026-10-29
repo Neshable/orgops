@@ -23,6 +23,7 @@ import {
   resolveVoiceRuntimeCredentials,
   type VoiceRuntimeSession,
 } from "./voice-runtime";
+import { withHostProviderEnvFallback } from "./realtime-provider-env";
 
 export const OPENAI_REALTIME_BASE_URL = "https://api.openai.com/v1/realtime";
 const OPENAI_REALTIME_SOCKET_URL = "wss://api.openai.com/v1/realtime";
@@ -742,8 +743,11 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
     const callId = String(payload.callId ?? "").trim();
     const channelId = event.channelId;
     if (!callId || !channelId || calls.has(callId)) return;
-    const env = await deps.api.getPackageSecretsEnv(agent.name, channelId).catch(() => ({}) as Record<string, string>);
-    const apiKey = env.OPENAI_API_KEY || process.env.OPENAI_API_KEY || "";
+    const scopedEnv = await deps.api
+      .getPackageSecretsEnv(agent.name, channelId)
+      .catch(() => ({}) as Record<string, string>);
+    const env = withHostProviderEnvFallback(scopedEnv);
+    const apiKey = env.OPENAI_API_KEY || "";
     const call: RealtimeCall = {
       callId,
       agent,
@@ -903,9 +907,12 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
     if (Array.isArray(named) && named.length > 0 && !named.includes(agent.name)) return;
     const callId = `lk:${roomId}:${agent.name}`;
     if (calls.has(callId)) return;
-    const env = await deps.api.getPackageSecretsEnv(agent.name, channelId).catch(() => ({}) as Record<string, string>);
+    const scopedEnv = await deps.api
+      .getPackageSecretsEnv(agent.name, channelId)
+      .catch(() => ({}) as Record<string, string>);
+    const env = withHostProviderEnvFallback(scopedEnv);
     const { provider, modelName } = splitModelId(agent.modelId);
-    const credentials = resolveVoiceRuntimeCredentials(provider, { ...process.env, ...env });
+    const credentials = resolveVoiceRuntimeCredentials(provider, env);
     const call: RealtimeCall = {
       callId,
       agent,

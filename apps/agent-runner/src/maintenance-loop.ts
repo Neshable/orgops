@@ -5,6 +5,7 @@ import {
   refreshCrossChannelRecentMemory,
 } from "./context-maintenance";
 import { isAgentSubscribed, type ChannelRecord } from "./models/channel";
+import { withRealtimeHostProviderEnvFallback } from "./realtime-provider-env";
 import type { Agent } from "./types";
 
 type Dependencies = {
@@ -45,7 +46,10 @@ export function createMaintenanceLoop(deps: Dependencies) {
     ): Promise<Record<string, string>> => {
       const cached = injectionEnvByChannel.get(channelId);
       if (cached) return cached;
-      const env = await deps.getPackageSecretsEnv(agent.name, channelId);
+      const env = withRealtimeHostProviderEnvFallback(
+        agent,
+        await deps.getPackageSecretsEnv(agent.name, channelId),
+      );
       injectionEnvByChannel.set(channelId, env);
       return env;
     };
@@ -61,9 +65,9 @@ export function createMaintenanceLoop(deps: Dependencies) {
     )?.id;
     const ensureCrossMemoryEnv = async (): Promise<Record<string, string>> => {
       if (crossMemoryEnv) return crossMemoryEnv;
-      crossMemoryEnv = await deps.getPackageSecretsEnv(
-        agent.name,
-        crossMemoryAuditChannelId,
+      crossMemoryEnv = withRealtimeHostProviderEnvFallback(
+        agent,
+        await deps.getPackageSecretsEnv(agent.name, crossMemoryAuditChannelId),
       );
       return crossMemoryEnv;
     };
