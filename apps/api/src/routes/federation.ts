@@ -3,10 +3,14 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { CHANNEL_KINDS, CHANNEL_VISIBILITY, schema, type OrgOpsDrizzleDb } from "@orgops/db";
 import { and, asc, eq, gt, sql } from "drizzle-orm";
 import type { AgentTransferBundle, createAgentTransfer } from "../agent-transfer";
+import type {AccessControl} from './access';
+import {federationFetch,federationUrl} from '../federation-transport';
 
 type AgentTransfer = ReturnType<typeof createAgentTransfer>;
 
 type FederationDeps = {
+  access:AccessControl;
+  workspaceRoot:string;
   orm: OrgOpsDrizzleDb;
   jsonResponse: (c: any, data: unknown, status?: number) => Response;
   requireAuth: (c: any, next: any) => Response | Promise<Response>;
@@ -79,7 +83,7 @@ function normalizeFederationParticipants(input: unknown) {
 }
 
 function normalizeBaseUrl(value: unknown) {
-  return trimString(value).replace(/\/+$/, "");
+  try{return federationUrl(trimString(value),true).origin;}catch{return '';}
 }
 
 function requestOrigin(c: any) {
@@ -117,6 +121,15 @@ function remoteEventIdempotencyKey(instanceId: string, remoteEventId: string) {
 
 export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
   const { orm, jsonResponse, requireAuth, insertEvent, eventRowToApi, agentTransfer } = deps;
+  app.use('/api/federation/*',async(c,next)=>{
+    if(/^\/api\/federation\/(?:channels\/[^/]+\/(?:events|participants|subscribers)|projections\/[^/]+\/events|agents\/[^/]+\/transfer|agents\/transfer)$/.test(c.req.path))return next();
+    return requireAuth(c,()=>deps.access.canManageInstance(c.get('user'))?next():jsonResponse(c,{error:'Instance owner required'},403));
+  });
+  function peerAllows(peer:any,key:string,value:string):boolean{
+    const metadata=parseJsonRecordSafe(peer.metadata_json);
+    if(key==='allowedChannelIds'&&metadata.joinChannelId===value)return true;
+    return Array.isArray(metadata[key])&&(metadata[key] as unknown[]).includes(value);
+  }
 
   function resolveFederationPeer(c: any) {
     const token = bearerToken(c);
@@ -126,7 +139,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     return (
       rows.find((row) => {
         const stored = typeof row.inbound_token_hash === "string" ? row.inbound_token_hash : "";
-        return stored && timingSafeStringEqual(stored, tokenHash);
+        return row.status === "ACTIVE" && stored && timingSafeStringEqual(stored, tokenHash);
       }) ?? null
     );
   }
@@ -151,10 +164,9 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     if (init?.body && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
     }
-    const response = await fetch(`${baseUrl}${path}`, { ...init, headers });
+    const response = await federationFetch(`${baseUrl}${path}`, { ...init, headers });
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Federation request failed: ${response.status} ${text}`);
+      throw new Error(`Federation request failed: ${response.status}`);
     }
     return response;
   }
@@ -713,6 +725,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     const auth = requireFederationPeer(c);
     if ("response" in auth) return auth.response;
     const localChannelId = c.req.param("channelId");
+    if(!peerAllows(auth.peer,'allowedChannelIds',localChannelId))return jsonResponse(c,{error:'Channel not granted to this peer'},403);
     const channelLink = orm
       .select()
       .from(schema.federationChannels)
@@ -782,6 +795,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     const auth = requireFederationPeer(c);
     if ("response" in auth) return auth.response;
     const channelId = c.req.param("channelId");
+    if(!peerAllows(auth.peer,'allowedChannelIds',channelId))return jsonResponse(c,{error:'Channel not granted to this peer'},403);
     const channelLink = orm
       .select()
       .from(schema.federationChannels)
@@ -879,6 +893,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     const homeBaseUrl =
       normalizeBaseUrl(joinUrl.searchParams.get("homeBaseUrl")) ||
       `${joinUrl.protocol}//${joinUrl.host}`.replace(/\/+$/, "");
+    if(!normalizeBaseUrl(homeBaseUrl))return jsonResponse(c,{error:'Invalid home origin'},400);
     const remoteChannelId = trimString(joinUrl.searchParams.get("channelId"));
     const channelName = trimString(joinUrl.searchParams.get("channelName")) || "federated-channel";
     const outboundToken = trimString(joinUrl.searchParams.get("token"));
@@ -1082,6 +1097,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     const auth = requireFederationPeer(c);
     if ("response" in auth) return auth.response;
     const channelId = c.req.param("channelId");
+    if(!peerAllows(auth.peer,'allowedChannelIds',channelId))return jsonResponse(c,{error:'Channel not granted to this peer'},403);
     const channelLink = orm
       .select()
       .from(schema.federationChannels)
@@ -1117,6 +1133,7 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     const auth = requireFederationPeer(c);
     if ("response" in auth) return auth.response;
     const channelId = c.req.param("channelId");
+    if(!peerAllows(auth.peer,'allowedChannelIds',channelId))return jsonResponse(c,{error:'Channel not granted to this peer'},403);
     const channel = orm
       .select({ id: schema.channels.id })
       .from(schema.channels)
@@ -1128,11 +1145,8 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     const source = trimString((body as Record<string, unknown>).source);
     if (!type || !source) return jsonResponse(c, { error: "type and source are required" }, 400);
     const payload = (body as Record<string, unknown>).payload ?? {};
-    const idempotencyKey =
-      trimString((body as Record<string, unknown>).idempotencyKey) ||
-      (trimString((body as Record<string, unknown>).originEventId)
-        ? remoteEventIdempotencyKey(auth.peer.id, trimString((body as Record<string, unknown>).originEventId))
-        : undefined);
+    const identity=trimString((body as Record<string,unknown>).idempotencyKey)||trimString((body as Record<string,unknown>).originEventId);
+    const idempotencyKey=identity?remoteEventIdempotencyKey(auth.peer.id,`${channelId}:${identity}`):undefined;
     if (idempotencyKey) {
       const existing = orm
         .select(compactEventRowSelectFields())
@@ -1173,7 +1187,8 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
   app.get("/api/federation/agents/:name/transfer", (c) => {
     const auth = requireFederationPeer(c);
     if ("response" in auth) return auth.response;
-    const bundle = agentTransfer.exportAgent(c.req.param("name"));
+    if(!peerAllows(auth.peer,'allowedAgentExports',c.req.param('name')))return jsonResponse(c,{error:'Agent export not granted'},403);
+    const bundle = agentTransfer.exportAgent(c.req.param("name"),{includeSecrets:false});
     if (!bundle) return jsonResponse(c, { error: "Not found" }, 404);
     return jsonResponse(c, bundle);
   });
@@ -1187,14 +1202,16 @@ export function registerFederationRoutes(app: Hono<any>, deps: FederationDeps) {
     }
     const targetName = trimString(body.agent.name);
     if (!targetName) return jsonResponse(c, { error: "name is required" }, 400);
+    if(!peerAllows(auth.peer,'allowedAgentImports',targetName))return jsonResponse(c,{error:'Agent import not granted'},403);
+    if(body.secrets?.length)return jsonResponse(c,{error:'Provision secrets locally after transfer'},403);
+    const owner=orm.select({id:schema.humans.id}).from(schema.humans).orderBy(asc(schema.humans.created_at),asc(schema.humans.id)).limit(1).get();
+    const sanitized={...body,secrets:[],agent:{...body.agent,visibility:'PRIVATE',ownerHumanId:owner?.id??null,additionalSkillRoots:[],allowOutsideWorkspace:false,allowOwnerHumanSecrets:false}};
     try {
-      const imported = agentTransfer.importAgent(body, {
+      const imported = agentTransfer.importAgent(sanitized, {
         name: targetName,
-        assignedRunnerId:
-          body.agent.assignedRunnerId === undefined
-            ? null
-            : (body.agent.assignedRunnerId as string | null),
-        desiredState: trimString(body.agent.desiredState) || "STOPPED",
+        workspacePath: `${deps.workspaceRoot}/${randomUUID()}`,
+        assignedRunnerId:null,
+        desiredState:'STOPPED',
       });
       insertEvent({
         type: "agent.control.copy",
