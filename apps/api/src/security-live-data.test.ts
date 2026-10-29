@@ -3,6 +3,7 @@ import {serve} from '@hono/node-server';
 import {once} from 'node:events';
 import {WebSocket} from 'ws';
 import type {AddressInfo} from 'node:net';
+import {randomUUID} from 'node:crypto';
 import {securityFixture} from './security-fixture';
 
 it('filters private events on org-wide topics and rechecks membership on every delivery',async()=>{
@@ -38,5 +39,31 @@ it('downloads active content inertly while preserving safe image previews',async
    expect(response.headers.get('content-type')).toBe(mime==='image/png'?'image/png':'application/octet-stream');
    expect(response.headers.get('content-disposition')).toMatch(mime==='image/png'?/^inline/:/^attachment/);
   }
+ }finally{f.close();}
+});
+
+it('filters private-channel process metadata and output over HTTP',async()=>{
+ const f=await securityFixture();
+ try{
+  const channel=await(await f.request('/api/channels',{name:'restricted-processes',visibility:'PRIVATE'})).json() as {id:string};
+  const processId=randomUUID();
+  f.engine.db.prepare("INSERT INTO agents(id,name,model_id,workspace_path,created_at,updated_at) VALUES(?,?,?,?,0,0)")
+   .run('public-process-agent','PublicProcess','openai:test',f.dir);
+  f.engine.db.prepare("INSERT INTO processes(id,agent_name,channel_id,cmd,cwd,state,started_at) VALUES(?,?,?,?,?,?,?)")
+   .run(processId,'PublicProcess',channel.id,'echo secret','/tmp','EXITED',Date.now());
+  f.engine.db.prepare("INSERT INTO process_output(id,process_id,seq,stream,text,ts) VALUES(?,?,?,?,?,?)")
+   .run(randomUUID(),processId,1,'STDOUT','private process output',Date.now());
+
+  const hiddenList=await f.engine.app.request('/api/processes?agentName=PublicProcess',{headers:{cookie:f.member.cookie}});
+  expect(hiddenList.status).toBe(200);
+  expect(await hiddenList.json()).toEqual([]);
+  const hiddenOutput=await f.engine.app.request(`/api/processes/${processId}/output`,{headers:{cookie:f.member.cookie}});
+  expect(hiddenOutput.status).toBe(403);
+
+  await f.request(`/api/channels/${channel.id}/subscribe`,{subscriberType:'HUMAN',subscriberId:'member'});
+  const visibleList=await f.engine.app.request('/api/processes?agentName=PublicProcess',{headers:{cookie:f.member.cookie}});
+  expect((await visibleList.json()) as unknown[]).toHaveLength(1);
+  const visibleOutput=await f.engine.app.request(`/api/processes/${processId}/output`,{headers:{cookie:f.member.cookie}});
+  expect((await visibleOutput.json()) as unknown[]).toHaveLength(1);
  }finally{f.close();}
 });
