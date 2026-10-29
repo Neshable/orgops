@@ -176,6 +176,7 @@ export const agentInvites = sqliteTable(
     created_by_type: text("created_by_type").notNull().default("HUMAN"),
     created_by_id: text("created_by_id"),
     created_by_human_id: text("created_by_human_id"),
+    owner_human_id: text("owner_human_id"),
     created_at: integer("created_at").notNull(),
     expires_at: integer("expires_at"),
     revoked_at: integer("revoked_at"),
