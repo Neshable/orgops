@@ -368,6 +368,8 @@ export const events = sqliteTable(
   (table) => ({
     idxEventsDeliverAt: index("idx_events_deliver_at").on(table.status, table.deliver_at),
     idxEventsChannel: index("idx_events_channel").on(table.channel_id, table.created_at),
+    idxEventsLifecycle: index("idx_events_lifecycle").on(table.type, table.source, table.created_at)
+      .where(sql`${table.type} IN ('agent.lifecycle.started', 'wrapper.lifecycle.started')`),
     uidxEventsIdempotency: uniqueIndex("uidx_events_idempotency")
       .on(table.idempotency_key)
       .where(sql`${table.idempotency_key} IS NOT NULL`)
