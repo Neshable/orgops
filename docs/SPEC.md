@@ -393,7 +393,7 @@ Published topics include:
 - `GET /api/models`
 - `POST /api/models`
 - `PATCH /api/models/:id`
-- model responses include inferred `capabilities` merged with optional `defaults.capabilities`; agents expose the same effective model capabilities as `modelCapabilities`. Capability flags are advisory UI/runtime metadata such as `audioInput`, `audioOutput`, `realtimeAudioInput`, `realtimeAudioOutput`, `imageInput`, and `toolCalling`. `replyContract` (`json` | `plain-text`) selects how native turns return their final output; it defaults to `plain-text` for OpenAI realtime models and `json` otherwise, and can be overridden per model via `defaults.capabilities.replyContract`. `contextWindowTokens` sizes the runner's prompt history budget; resolution is capability (inferred 32k for OpenAI realtime models, or `defaults.capabilities.contextWindowTokens`) → models.dev metadata → a built-in fallback table. When history is cut, the runner adds a `system.history.truncated` note carrying `omittedBefore` (oldest included `createdAt`) and instructions to page older events with `events_channel_messages` / `events_search` using `before` + `order: "desc"`.
+- model responses include inferred `capabilities` merged with optional `defaults.capabilities`; agents expose the same effective model capabilities as `modelCapabilities`. Capability flags are advisory UI/runtime metadata such as `audioInput`, `audioOutput`, `realtimeAudioInput`, `realtimeAudioOutput`, `imageInput`, and `toolCalling`. `classicTurns: false` marks realtime-only models that should not be scheduled for queued CLASSIC turns. `replyContract` (`json` | `plain-text`) selects how native turns return their final output; it defaults to `plain-text` for OpenAI realtime models and `json` otherwise, and can be overridden per model via `defaults.capabilities.replyContract`. `contextWindowTokens` sizes the runner's prompt history budget; resolution is capability (inferred 32k for OpenAI realtime models, or `defaults.capabilities.contextWindowTokens`) → models.dev metadata → a built-in fallback table. When history is cut, the runner adds a `system.history.truncated` note carrying `omittedBefore` (oldest included `createdAt`) and instructions to page older events with `events_channel_messages` / `events_search` using `before` + `order: "desc"`.
 
 ### Realtime Voice
 
@@ -472,7 +472,9 @@ Direct calls and channel voice rooms (`apps/api/src/voice-realtime.ts`,
    closed), agents leave after a short grace period and emit `voice.room.ended`
    so they cannot keep talking to each other.
 5. Tool calls from any realtime provider run on the runner host with the same
-   tools and filesystem allowlist as text turns.
+   tools and filesystem allowlist as text turns. Delayed scheduling tools are
+   hidden only when `modelCapabilities.classicTurns === false`, because their
+   future trigger would run through the queued CLASSIC turn path.
 6. Text posted to the channel during a call is injected into the live session
    as a `[channel] <source>: <text>` item instead of starting a text turn.
    Other agents' realtime transcripts use `[voice]` and do not trigger a

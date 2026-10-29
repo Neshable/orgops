@@ -3,6 +3,7 @@ import { toolParametersJsonSchema } from "@orgops/llm";
 import { listSkillsFromRoots, loadSkillEventShapes } from "@orgops/skills";
 import {
   getCoreEventShapes,
+  inferModelCapabilities,
   serializeEventShapes,
   validateEventAgainstShapes,
 } from "@orgops/schemas";
@@ -167,6 +168,15 @@ function splitModelId(modelId: string) {
   const provider = colon > 0 ? modelId.slice(0, colon).trim().toLowerCase() : "";
   const modelName = colon > 0 ? modelId.slice(colon + 1).trim() : modelId.trim();
   return { provider, modelName };
+}
+
+function supportsClassicTurns(agent: Agent) {
+  const { provider, modelName } = splitModelId(agent.modelId);
+  const capabilities = {
+    ...inferModelCapabilities(provider, modelName),
+    ...(agent.modelCapabilities ?? {}),
+  };
+  return capabilities.classicTurns !== false;
 }
 
 function agentIsRealtimeCapable(agent: Agent) {
@@ -482,14 +492,14 @@ export function createRealtimeVoiceManager(deps: RealtimeVoiceDeps) {
       apiFetch: deps.api.apiFetch,
       emitEvent: deps.api.emitEvent,
     });
+    const delayedSchedulingTools = [
+      "events_scheduled_create",
+      "events_scheduled_update",
+      "events_scheduled_delete",
+      "events_schedule_self",
+    ];
     const realtimeToolEntries = Object.entries(toolsByName).filter(
-      ([name]) =>
-        ![
-          "events_scheduled_create",
-          "events_scheduled_update",
-          "events_scheduled_delete",
-          "events_schedule_self",
-        ].includes(name),
+      ([name]) => supportsClassicTurns(call.agent) || !delayedSchedulingTools.includes(name),
     );
     const tools = await Promise.all(
       realtimeToolEntries.map(async ([name, tool]) => ({

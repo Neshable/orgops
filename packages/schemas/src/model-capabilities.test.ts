@@ -25,6 +25,7 @@ describe("replyContract capability", () => {
     expect(resolveModelCapabilities("google", "gemini-2.5-flash-native-audio-preview-09-2025")).toMatchObject({
       realtimeAudioInput: true,
       realtimeAudioOutput: true,
+      classicTurns: false,
     });
     expect(resolveModelCapabilities("gemini", "gemini-2.0-flash-live-001").realtimeAudioInput).toBe(true);
     expect(resolveModelCapabilities("liquid", "lfm3-audio-2b")).toMatchObject({

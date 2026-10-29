@@ -12,6 +12,8 @@ export const ModelCapabilitiesSchema = z
     multiSpeakerRealtimeAudioInput: z.boolean().optional(),
     activeSpeakerRealtimeAudioInput: z.boolean().optional(),
     toolCalling: z.boolean().optional(),
+    /** Whether this model can run regular queued CLASSIC turns outside a realtime voice session. */
+    classicTurns: z.boolean().optional(),
     /** How native turns return their final output: a JSON event object, or plain text posted as the reply. */
     replyContract: z.enum(["json", "plain-text"]).optional(),
     /** Overrides model metadata when sizing prompt history. */
@@ -104,6 +106,7 @@ export function inferModelCapabilities(providerInput: string, modelNameInput: st
     capabilities.multiSpeakerRealtimeAudioInput = true;
     capabilities.imageInput = true;
     capabilities.replyContract = "plain-text";
+    capabilities.classicTurns = false;
   }
 
   if (

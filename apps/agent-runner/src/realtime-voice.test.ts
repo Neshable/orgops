@@ -103,8 +103,17 @@ function setup() {
   return { manager, sockets, emitted, fetches, toolCalls };
 }
 
-async function attachCall(ctx: ReturnType<typeof setup>) {
-  expect(ctx.manager.consume(agent, [callStarted()])).toEqual([]);
+async function attachCall(
+  ctx: ReturnType<typeof setup>,
+  inputAgent: Agent = agent,
+  event?: Event,
+) {
+  const startEvent =
+    event ??
+    callStarted({
+      payload: { ...(callStarted().payload as Record<string, unknown>), targetAgentName: inputAgent.name },
+    });
+  expect(ctx.manager.consume(inputAgent, [startEvent])).toEqual([]);
   await flush();
   const socket = ctx.sockets[0]!;
   socket.fire("open", {});
@@ -128,9 +137,33 @@ describe("realtime voice manager", () => {
     const shellRun = update.session.tools.find((tool: any) => tool.name === "shell_run");
     expect(shellRun).toMatchObject({ type: "function", parameters: { type: "object" } });
     expect(shellRun.parameters.required).toContain("cmd");
+    expect(update.session.tools.map((tool: any) => tool.name)).toContain("events_schedule_self");
+    expect(update.session.tools.map((tool: any) => tool.name)).toContain("events_scheduled_create");
+    expect(ctx.manager.hasActiveCall("voice-agent", "chan-1")).toBe(true);
+  });
+
+  it("hides delayed scheduling tools when model capabilities disable classic turns", async () => {
+    const ctx = setup();
+    const realtimeOnlyAgent = {
+      ...agent,
+      name: "realtime-only-agent",
+      modelCapabilities: { realtimeAudioInput: true, realtimeAudioOutput: true, classicTurns: false },
+    };
+    const socket = await attachCall(
+      ctx,
+      realtimeOnlyAgent,
+      callStarted({
+        payload: {
+          ...(callStarted().payload as Record<string, unknown>),
+          targetAgentName: "realtime-only-agent",
+        },
+      }),
+    );
+
+    expect(socket.url).toContain("api.openai.com");
+    const update = socket.sent.find((message) => message.type === "session.update");
     expect(update.session.tools.map((tool: any) => tool.name)).not.toContain("events_schedule_self");
     expect(update.session.tools.map((tool: any) => tool.name)).not.toContain("events_scheduled_create");
-    expect(ctx.manager.hasActiveCall("voice-agent", "chan-1")).toBe(true);
   });
 
   it("posts the human utterance before the agent reply even when transcription lands late", async () => {
