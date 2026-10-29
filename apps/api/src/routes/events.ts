@@ -333,7 +333,7 @@ export function registerEventsRoutes(app: Hono<any>, deps: EventsDeps) {
     let remaining = MAX_EVENT_PAGE_PAYLOAD_BYTES;
     return rows.map(row => {
       const bytes = Number(row.payload_bytes);
-      if (!Number.isFinite(bytes) || bytes > payloadLimit || bytes > remaining) return {...row, payload_truncated: true};
+      if (!Number.isFinite(bytes) || bytes > payloadLimit || bytes > remaining) return {...row, payload_truncated: true, payload_max_chars: payloadLimit};
       let payload: string;
       if (row.payload_blob_storage_path) {
         // Read only the declared bounded file, never an unbounded historical blob.

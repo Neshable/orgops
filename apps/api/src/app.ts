@@ -332,7 +332,7 @@ export function createApp(config: AppConfig = {}) {
       return {
         payload: {
           truncated: true,
-          omittedChars: originalLength - MAX_EVENT_PAYLOAD_JSON_CHARS,
+          omittedChars: originalLength - maxChars,
         },
         payloadTruncated: true,
       };

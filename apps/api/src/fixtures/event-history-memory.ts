@@ -49,6 +49,11 @@ for(let page=0;page<10;page++) {
    assert.ok(!event.payloadTruncated,'Ordinary inputs cannot be acknowledged as omitted');
    assert.equal(shouldHandleEventForAgent(agent,event),true);
   }
+  if(event.id==='huge-message') {
+   const hugeChars=(db.prepare("SELECT length(payload_json) AS n FROM events WHERE id='huge-message'").get() as {n:number}).n;
+   assert.equal(event.payload.truncated,true);
+   assert.equal(event.payload.omittedChars,hugeChars-1024*1024);
+  }
   if(event.id==='huge-message'||event.id==='other-target') assert.equal(shouldHandleEventForAgent(agent,event),false,'Omission must not broaden targeting');
  }
  const pending=(db.prepare("SELECT count(*) AS n FROM event_receipts WHERE status='PENDING'").get() as {n:number}).n;
