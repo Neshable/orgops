@@ -53,6 +53,8 @@ const MAX_EVENT_DISPATCH_ATTEMPTS = 3;
 const DEFAULT_MEMORY_CONTEXT_MODE = "PER_CHANNEL_CROSS_CHANNEL" as const;
 const FALLBACK_MODEL_CONTEXT_WINDOW_TOKENS = 128_000;
 const DEFAULT_MAX_LLM_MESSAGE_CHARS = 200_000;
+const RESPONSE_FORMAT_ERROR =
+  "I hit a response-format issue and could not produce a clean chat message. Please try again.";
 
 type MemoryContextMode = "PER_CHANNEL_CROSS_CHANNEL" | "FULL_CHANNEL_EVENTS" | "OFF";
 
@@ -199,11 +201,43 @@ function extractJsonObject(rawText: string): unknown {
   }
 }
 
+// Display fallback can recover a trailing event envelope; strict dispatch still requires clean JSON.
+function extractTrailingEvent(rawText: string): unknown {
+  if (!rawText.endsWith("}")) throw new Error("No trailing object.");
+  let depth = 0;
+  let inString = false;
+  for (let index = rawText.length - 1; index >= 0; index -= 1) {
+    const char = rawText[index];
+    if (char === "\"") {
+      let backslashes = 0;
+      for (let previous = index - 1; previous >= 0 && rawText[previous] === "\\"; previous -= 1) {
+        backslashes += 1;
+      }
+      if (backslashes % 2 === 0) inString = !inString;
+    }
+    if (inString) continue;
+    if (char === "}") depth += 1;
+    if (char === "{" && --depth === 0) {
+      const parsed = JSON.parse(rawText.slice(index));
+      if (parsed && typeof parsed === "object" && "type" in parsed && "payload" in parsed) {
+        return parsed;
+      }
+      break;
+    }
+  }
+  throw new Error("No trailing event envelope.");
+}
+
 export function normalizeFallbackMessageText(rawText: string): string {
   const trimmed = rawText.trim();
   if (!trimmed) return "Unable to produce structured event output.";
   try {
-    const parsed = extractJsonObject(trimmed);
+    let parsed: unknown;
+    try {
+      parsed = extractJsonObject(trimmed);
+    } catch {
+      parsed = extractTrailingEvent(trimmed);
+    }
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       const payload = (parsed as Record<string, unknown>).payload;
       if (payload && typeof payload === "object" && !Array.isArray(payload)) {
@@ -213,7 +247,7 @@ export function normalizeFallbackMessageText(rawText: string): string {
         }
       }
       // Do not leak raw event JSON into chat when fallback is triggered.
-      return "I hit a response-format issue and could not produce a clean chat message. Please try again.";
+      return RESPONSE_FORMAT_ERROR;
     }
   } catch {
     // Keep plain-text fallbacks as-is.
@@ -275,23 +309,6 @@ function generateUsedTools(result: GenerateResult): boolean {
   if ((result.toolCalls?.length ?? 0) > 0) return true;
   if ((result.toolResults?.length ?? 0) > 0) return true;
   return result.finishReason === "tool-calls";
-}
-
-function buildFallbackMessageEvent(
-  agentName: string,
-  channelId: string,
-  text: string,
-  parentEventId?: string,
-) {
-  return {
-    type: "message.created",
-    source: `agent:${agentName}`,
-    channelId,
-    payload: {
-      text: normalizeFallbackMessageText(text),
-    },
-    ...(parentEventId ? { parentEventId } : {}),
-  };
 }
 
 function shouldEmitAuditEvents(agent: Agent): boolean {
@@ -751,10 +768,27 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       utilizationPct: Math.round(utilizationPct * 100) / 100,
     });
 
+    let pendingMessages: ModelEventDraft[] = [];
+    const flushMessages = async () => {
+      for (const [index, draft] of pendingMessages.entries()) {
+        await input.api.emitEvent({
+          ...draft,
+          idempotencyKey: draft.idempotencyKey ?? `turn:${agent.name}:${triggerEvent.id}:message:${index}`,
+        });
+      }
+    };
+
     const executeCtx = {
       agent,
       triggerEvent,
       channelId,
+      ...((agent.mode ?? "CLASSIC") === "CLASSIC"
+        ? {
+            deferMessage: (draft: ModelEventDraft) => {
+              pendingMessages.push(draft);
+            },
+          }
+        : {}),
       extraAllowedRoots: selectedSkills.map((skill: any) => skill.path),
       injectionEnv,
       apiFetch: input.api.apiFetch,
@@ -844,6 +878,9 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
     const classicMaxModelSteps = resolveAgentClassicMaxModelSteps(agent);
     let lastResponseText = "";
     for (let attempt = 1; attempt <= MAX_EVENT_DISPATCH_ATTEMPTS; attempt += 1) {
+      pendingMessages = [];
+      postedMessageToChannel = false;
+      lastResponseText = "";
       let result: GenerateResult;
       try {
         result = await withTimeout(
@@ -920,6 +957,7 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
       if (hasLateInjectedEvents) continue;
       if (!responseText.trim()) {
         if (postedMessageToChannel) {
+          await flushMessages();
           await emitTurnEvent("agent.turn.completed", {});
           return;
         }
@@ -947,6 +985,7 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         }
         // The model already replied here via events_emit; posting its final text too would duplicate it.
         if (postedMessageToChannel) {
+          await flushMessages();
           await emitTurnEvent("agent.turn.completed", {});
           return;
         }
@@ -1027,17 +1066,31 @@ export function createTurnExecutor(input: CreateTurnExecutorInput) {
         });
         continue;
       }
+      await flushMessages();
       await input.api.emitEvent(eventDraft);
       await emitTurnEvent("agent.turn.completed", {});
       return;
     }
-    if (!lastResponseText.trim() || postedMessageToChannel) {
-      await emitTurnEvent("agent.turn.completed", postedMessageToChannel ? {} : { noReply: true });
+    await flushMessages();
+    const hasAnswer = pendingMessages.some((draft) => draft.channelId === channelId);
+    if (hasAnswer) {
+      await emitTurnEvent("agent.turn.completed", { completedWithFallback: true });
       return;
     }
-    await input.api.emitEvent(
-      buildFallbackMessageEvent(agent.name, channelId, lastResponseText, triggerEvent.id),
-    );
-    await emitTurnEvent("agent.turn.completed", { completedWithFallback: true });
+    if (!lastResponseText.trim()) {
+      await emitTurnEvent("agent.turn.completed", { noReply: true });
+      return;
+    }
+    await emitTurnEvent("agent.turn.phase", {
+      phase: "response.format_error",
+      detail: RESPONSE_FORMAT_ERROR,
+      attempts: MAX_EVENT_DISPATCH_ATTEMPTS,
+      responsePreview: truncateOversizedText(lastResponseText.trim(), 500),
+    });
+    await emitTurnEvent("agent.turn.completed", {
+      completedWithFallback: true,
+      noReply: true,
+      responseFormatError: true,
+    });
   };
 }
