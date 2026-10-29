@@ -10,10 +10,12 @@ import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { AGENT_VISIBILITY, isAgentVisibility, schema, type OrgOpsDrizzleDb } from "@orgops/db";
+import { resolveModelCapabilities, type ModelCapabilities } from "@orgops/schemas";
 import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import type { EventBus } from "@orgops/event-bus";
 import type { AccessControl, RequestUser } from "./access";
 import type { AgentTransferBundle, createAgentTransfer } from "../agent-transfer";
+import {latestAgentStarts} from '../agent-starts';
 
 type AgentTransfer = ReturnType<typeof createAgentTransfer>;
 
@@ -138,6 +140,35 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
 
   function lifecycleChannelName(agentName: string) {
     return `agent.lifecycle.${agentName}`;
+  }
+
+  function modelCapabilitiesById(): Map<string, ModelCapabilities> {
+    const rows = orm.select().from(schema.models).all() as any[];
+    const result = new Map<string, ModelCapabilities>();
+    for (const row of rows) {
+      result.set(
+        row.id,
+        resolveModelCapabilities(
+          row.provider,
+          row.model_name,
+          parseJsonRecordSafe(row.defaults_json) ?? {},
+        ),
+      );
+    }
+    return result;
+  }
+
+  function capabilitiesForAgentModel(
+    modelId: string,
+    capabilitiesById: Map<string, ModelCapabilities>,
+  ): ModelCapabilities {
+    const configured = capabilitiesById.get(modelId);
+    if (configured) return configured;
+    const colon = modelId.indexOf(":");
+    if (colon === -1) {
+      return resolveModelCapabilities("", modelId, {});
+    }
+    return resolveModelCapabilities(modelId.slice(0, colon), modelId.slice(colon + 1), {});
   }
 
   function resolveAgentLifecycleChannelId(agentName: string): string | undefined {
@@ -351,6 +382,9 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
           .all() as any[])
       : (orm.select().from(schema.agents).all() as any[]);
     const user = c.get("user") as RequestUser | undefined;
+    const capabilitiesById = modelCapabilitiesById();
+
+    const starts=latestAgentStarts(orm,rows.filter(row=>access.canViewAgent(user,row.name)).map(row=>row.name));
     return jsonResponse(
       c,
       rows.map((row) => ({
@@ -359,6 +393,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
         icon: row.icon,
         description: row.description,
         modelId: row.model_id,
+        modelCapabilities: capabilitiesForAgentModel(row.model_id, capabilitiesById),
         soulContents: row.soul_contents ?? "",
         enabledSkills: parseStringArraySafe(row.enabled_skills_json),
         alwaysPreloadedSkills: parseStringArraySafe(row.always_preloaded_skills_json),
@@ -376,6 +411,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
         desiredState: row.desired_state,
         runtimeState: row.runtime_state,
         lastHeartbeatAt: row.last_heartbeat_at,
+        lastStartedAt: starts.get(row.name) ?? null,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         visibility:
@@ -538,12 +574,14 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
     }
     const row = orm.select().from(schema.agents).where(eq(schema.agents.name, name)).get() as any;
     if (!row) return jsonResponse(c, { error: "Not found" }, 404);
+    const capabilitiesById = modelCapabilitiesById();
     return jsonResponse(c, {
       id: row.id,
       name: row.name,
       icon: row.icon,
       description: row.description,
       modelId: row.model_id,
+      modelCapabilities: capabilitiesForAgentModel(row.model_id, capabilitiesById),
       soulContents: row.soul_contents ?? "",
       enabledSkills: parseStringArraySafe(row.enabled_skills_json),
       alwaysPreloadedSkills: parseStringArraySafe(row.always_preloaded_skills_json),
@@ -561,6 +599,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       desiredState: row.desired_state,
       runtimeState: row.runtime_state,
       lastHeartbeatAt: row.last_heartbeat_at,
+      lastStartedAt: latestAgentStarts(orm,[row.name]).get(row.name) ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       visibility:

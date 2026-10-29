@@ -368,6 +368,8 @@ export const events = sqliteTable(
   (table) => ({
     idxEventsDeliverAt: index("idx_events_deliver_at").on(table.status, table.deliver_at),
     idxEventsChannel: index("idx_events_channel").on(table.channel_id, table.created_at),
+    idxEventsLifecycle: index("idx_events_lifecycle").on(table.type, table.source, table.created_at)
+      .where(sql`${table.type} IN ('agent.lifecycle.started', 'wrapper.lifecycle.started')`),
     uidxEventsIdempotency: uniqueIndex("uidx_events_idempotency")
       .on(table.idempotency_key)
       .where(sql`${table.idempotency_key} IS NOT NULL`)
@@ -395,6 +397,15 @@ export const eventReceipts = sqliteTable(
     )
   })
 );
+
+export const eventPayloadBlobs = sqliteTable("event_payload_blobs", {
+  event_id: text("event_id").primaryKey(),
+  storage_path: text("storage_path").notNull(),
+  char_length: integer("char_length").notNull(),
+  byte_length: integer("byte_length").notNull(),
+  sha256: text("sha256").notNull(),
+  created_at: integer("created_at").notNull()
+});
 
 export const processes = sqliteTable("processes", {
   id: text("id").primaryKey(),
@@ -727,6 +738,7 @@ export const schema = {
   threads,
   events,
   eventReceipts,
+  eventPayloadBlobs,
   processes,
   processOutput,
   files,
