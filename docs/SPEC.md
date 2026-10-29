@@ -625,6 +625,7 @@ Presence events (bookkeeping only):
 ### Billing
 
 - `GET /api/billing/prices` returns known model price snapshots
+- `POST /api/billing/prices` upserts one price snapshot (or a `{ prices: [...] }` batch) for `provider:model` IDs; useful for runner-authenticated agent maintenance when billing encounters unknown models
 - `POST /api/billing/prices/refresh/openrouter` fetches OpenRouter's live model/pricing catalog and snapshots rates as `openrouter:<slug>` model IDs
 - `POST /api/billing/usage` is runner-authenticated and records provider token usage for native runner calls
 - `GET /api/billing/usage?groupBy=provider|model|agent|channel&since=<ms>&until=<ms>` returns visible aggregate usage/cost totals; the admin UI exposes predefined periods and custom start/end filters
