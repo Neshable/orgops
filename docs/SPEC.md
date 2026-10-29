@@ -185,6 +185,12 @@ Stored in `runner_nodes`:
 - lifecycle: `created_at`, `updated_at`, `last_seen_at`
 
 Runner IDs are stable across restarts by persisting local `.agent-runner-id`.
+Runners keep a runner-authenticated socket open at `GET /api/runners/:id/ws`.
+When `insertEvent()` creates receipt rows, the API pushes compact
+`event.available` wakeups to the assigned runner for each recipient agent. The
+runner still performs slower HTTP fallback polls for reconnect/catch-up and for
+agent/channel membership changes; SQLite receipts remain the source of truth for
+at-least-once delivery.
 
 ### Federation
 
@@ -212,7 +218,7 @@ of truth for ordering and policy.
 
 - `events`: append-only event log (`type`, `payload_json`, `source`, `channel_id`, `deliver_at`, `status`, failure counters, idempotency key)
 - `event_payload_blobs`: file-backed storage metadata for oversized event payload JSON spilled out of SQLite
-- `event_receipts`: per-agent delivery state (`PENDING`/`DELIVERED`) used by runner polling
+- `event_receipts`: per-agent delivery state (`PENDING`/`DELIVERED`) used by runner socket wakeups and HTTP catch-up polling
 
 ### Memory Summaries
 
@@ -232,7 +238,7 @@ of truth for ordering and policy.
 
 ### Agent Invites / Runner Tokens
 
-- `agent_invites`: wrapped-agent bootstrap invites (hashed token, optional scoped channel set, optional channel expansion, invite-time agent visibility, creator metadata for human/agent callers, optional wrapped config, expiry, usage count)
+- `agent_invites`: wrapped-agent bootstrap invites (hashed token, optional scoped channel set, optional channel expansion, invite-time agent visibility, optional private-agent owner human, creator metadata for human/agent callers, optional wrapped config, expiry, usage count)
 - `runner_tokens`: hashed runner credentials, including invite-scoped tokens bound to a single `agent_name` and `runner_id`
 
 ## Event Contract
@@ -380,6 +386,34 @@ Published topics include:
 - `org:dashboard`
 - `agent:<name>`-style source topics for agent-sourced events
 
+Runner wake socket: `GET /api/runners/:id/ws`
+
+Runner clients authenticate with `x-orgops-runner-token`; scoped runner tokens
+may only connect to their allowed runner ID. The runner sends `{"type":"ping"}`
+after connection and periodically thereafter. The API responds with
+`{"type":"pong","now":...}` and sends compact wakeups:
+
+```json
+{
+  "type": "event.available",
+  "runnerId": "runner-id",
+  "events": [
+    {
+      "eventId": "...",
+      "eventType": "message.created",
+      "agentName": "agent",
+      "channelId": "channel",
+      "createdAt": 123,
+      "deliverAt": 456
+    }
+  ]
+}
+```
+
+Wakeups are advisory. The runner fetches pending receipts through the existing
+HTTP event listing before executing turns, and delayed wakeups are delivered when
+`deliverAt` is due.
+
 ## HTTP API Surface
 
 ### Infra
@@ -415,6 +449,7 @@ Published topics include:
   - `POST /api/agent-invites/public/:token/redeem` (public)
   - `channelIds` is optional on create (invite may grant lifecycle-only bootstrap access)
   - create payload supports `visibility` (`PUBLIC`/`PRIVATE`) applied to the wrapped agent at redeem time
+  - private invite create payloads support `ownerHumanId`; human-created private invites default to the creator, and redeemed private agents copy this owner so scoped runners can later update wrapped runtime config
   - create payload supports `runnerScopeMode` (`SCOPED` default, or `GLOBAL`)
   - create payload supports `allowChannelExpansion` for scoped invites; this does not auto-subscribe the agent, but lets the redeemed scoped runner follow channels where the agent is explicitly subscribed after redemption. Scoped invites with no initial `channelIds` automatically enable channel expansion.
   - invite list/create responses include creator metadata (`createdByType`, `createdById`)

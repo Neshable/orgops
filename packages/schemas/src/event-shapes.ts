@@ -729,12 +729,6 @@ const coreEventShapes: EventShapeDefinition[] = [
     payloadSchema: z.record(z.string(), z.unknown()),
   },
   {
-    type: "audit.secret.accessed",
-    description: "Audit record for secret access.",
-    source: "core",
-    payloadSchema: z.record(z.string(), z.unknown()),
-  },
-  {
     type: "audit.secret.deleted",
     description: "Audit record for secret deletion.",
     source: "core",

@@ -63,6 +63,7 @@ import { createVoiceBroker } from "./voice-broker";
 import type { transcribe as TranscribeFn } from "@orgops/llm";
 import { registerFederationRoutes } from "./routes/federation";
 import { registerWorkspacePublicationRoutes } from "./routes/workspace-publications";
+import { createRunnerSocketHub } from "./runner-socket";
 import {
   findActiveRunnerTokenByToken,
   parseStringArraySafe as parseRunnerScopeChannels,
@@ -484,6 +485,23 @@ export function createApp(config: AppConfig = {}) {
     });
   }
 
+  const runnerSocketHub = createRunnerSocketHub({
+    orm,
+    upgradeWebSocket,
+    resolveRequestUser: (c: any) => {
+      const runnerHeader = c.req.header("x-orgops-runner-token");
+      const runnerUser = resolveRunnerUserFromToken(runnerHeader);
+      if (runnerUser) return runnerUser;
+      const cookie = c.req.header("cookie") ?? "";
+      const token = cookie
+        .split(";")
+        .map((part: string) => part.trim())
+        .find((part: string) => part.startsWith("orgops_session="))
+        ?.slice("orgops_session=".length);
+      return token ? sessions.get(token) ?? null : null;
+    },
+  });
+
   function insertEvent(input: any) {
     const resolveRecipientAgents = (): string[] => {
       const recipients = new Set<string>();
@@ -611,6 +629,7 @@ export function createApp(config: AppConfig = {}) {
       throw error;
     }
     publishEvent(row);
+    runnerSocketHub.notifyEvent(row, recipientAgents);
     void pushFederatedEvent(row);
     return row;
   }
@@ -797,6 +816,8 @@ export function createApp(config: AppConfig = {}) {
     },
     access,
   });
+
+  runnerSocketHub.registerRoutes(app as any);
 
   registerRunnersRoutes(app as any, {
     access,
