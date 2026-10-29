@@ -15,6 +15,7 @@ import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import type { EventBus } from "@orgops/event-bus";
 import type { AccessControl, RequestUser } from "./access";
 import type { AgentTransferBundle, createAgentTransfer } from "../agent-transfer";
+import {canonicalPath,isWithinPath,prepareWorkspaceRoot} from '../workspace-boundary';
 import {latestAgentStarts} from '../agent-starts';
 
 type AgentTransfer = ReturnType<typeof createAgentTransfer>;
@@ -51,6 +52,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
     agentTransfer,
     transferToPeer,
   } = deps;
+  const workspaceRoot=prepareWorkspaceRoot(process.env.ORGOPS_WORKSPACE_ROOT||resolve(PROJECT_ROOT,'.orgops-data/workspaces'));
   const publishDashboardRefresh = (reason: string, meta?: Record<string, unknown>) => {
     bus.publish("org:dashboard", {
       type: "dashboard_refresh",
@@ -120,7 +122,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
     );
   }
 
-  function resolveAgentWorkspacePath(agentName: string) {
+  function resolveAgentWorkspacePath(agentName: string, user:RequestUser|undefined) {
     const row = orm
       .select({
         workspacePath: schema.agents.workspace_path
@@ -132,6 +134,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       return { error: "Not found", status: 404 as const };
     }
     const workspacePath = resolveWorkspacePath(row.workspacePath ?? "");
+    if(!access.canManageInstance(user)&&!isWithinPath(workspacePath,workspaceRoot,false))return {error:'Workspace outside managed root',status:403 as const};
     if (!workspacePath.trim()) {
       return { error: "Workspace path is not configured", status: 400 as const };
     }
@@ -201,11 +204,11 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       workspacePath,
       relativePathValue ? relativePathValue : "."
     );
-    if (!isWithinDirectory(targetPath, workspacePath)) {
+    if (!isWithinDirectory(targetPath, workspacePath)||!isWithinPath(targetPath,workspacePath)) {
       return { error: "Invalid workspace path", status: 400 as const };
     }
     return {
-      targetPath,
+      targetPath:canonicalPath(targetPath),
       relativePath: toPosixPath(relative(workspacePath, targetPath))
     };
   }
@@ -453,7 +456,8 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       scopedRunner?.allowedRunnerId ?? assignedRunnerId;
     const id = randomUUID();
     const now = Date.now();
-    const workspacePath = resolveWorkspacePath(String(body.workspacePath ?? ""));
+    const workspacePath = access.canManageInstance(user)
+      ? resolveWorkspacePath(String(body.workspacePath ?? "")) : resolve(workspaceRoot,id);
     if (!workspacePath.trim()) {
       return jsonResponse(c, { error: "workspacePath is required" }, 400);
     }
@@ -472,6 +476,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
     );
     const additionalSkillRoots = normalizeAdditionalSkillRoots(body.additionalSkillRoots);
     const mode = normalizeAgentMode(body.mode);
+    if((mode==='WRAPPED'||body.allowOutsideWorkspace||additionalSkillRoots.length)&&!access.canConfigureHostRuntime(user,effectiveAssignedRunnerId))return jsonResponse(c,{error:'Host runtime configuration requires operator approval'},403);
     const allowOutsideWorkspace = mode === "WRAPPED" ? false : Boolean(body.allowOutsideWorkspace);
     const llmCallTimeoutParsed = parseOptionalPositiveInt(body.llmCallTimeoutMs);
     if (!llmCallTimeoutParsed.ok) {
@@ -516,7 +521,8 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       visibility === AGENT_VISIBILITY.PRIVATE
         ? ownerHumanIdRequested ??
           (user?.username && user.username !== "runner" ? user.id ?? null : null)
-        : null;
+        : (user?.username&&user.username!=='runner'?user.id??null:null);
+    if(ownerHumanIdRequested&&ownerHumanIdRequested!==user?.id&&!access.canManageInstance(user))return jsonResponse(c,{error:'Cannot assign another human as owner'},403);
     if (visibility === AGENT_VISIBILITY.PRIVATE && !ownerHumanId) {
       return jsonResponse(
         c,
@@ -627,6 +633,9 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
     const body = await c.req.json();
     const existing = orm.select().from(schema.agents).where(eq(schema.agents.name, name)).get() as any;
     if (!existing) return jsonResponse(c, { error: "Not found" }, 404);
+    if(body.ownerHumanId!==undefined&&body.ownerHumanId!==existing.owner_human_id&&!access.canManageInstance(user))return jsonResponse(c,{error:'Ownership changes require operator approval'},403);
+    if(!access.canManageInstance(user)&&body.workspacePath!==undefined&&resolveWorkspacePath(String(body.workspacePath))!==existing.workspace_path)return jsonResponse(c,{error:'Workspace changes require operator approval'},403);
+    if((existing.mode==='WRAPPED'||String(body.mode??'').toUpperCase()==='WRAPPED'||body.wrappedConfig!==undefined||body.allowOutsideWorkspace||body.additionalSkillRoots!==undefined)&&!access.canConfigureHostRuntime(user,existing.assigned_runner_id))return jsonResponse(c,{error:'Host runtime configuration requires operator approval'},403);
     if (
       body.name !== undefined &&
       String(body.name ?? "").trim() &&
@@ -753,7 +762,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
         ? ownerHumanIdRequested !== undefined
           ? ownerHumanIdRequested
           : (existing.owner_human_id ?? user?.id ?? null)
-        : null;
+        : (existing.owner_human_id??null);
     if (nextVisibility === AGENT_VISIBILITY.PRIVATE && !nextOwnerHumanId) {
       return jsonResponse(
         c,
@@ -976,6 +985,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
   });
 
   app.get("/api/agents/:name/transfer", (c) => {
+    if(!access.canManageInstance(c.get('user')))return jsonResponse(c,{error:'Instance owner required'},403);
     const name = c.req.param("name");
     const user = c.get("user") as RequestUser | undefined;
     if (!access.canManageAgent(user, name)) {
@@ -987,6 +997,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
   });
 
   app.post("/api/agents/:name/copy", async (c) => {
+    if(!access.canManageInstance(c.get('user')))return jsonResponse(c,{error:'Instance owner required'},403);
     const sourceName = c.req.param("name");
     const user = c.get("user") as RequestUser | undefined;
     if (!access.canManageAgent(user, sourceName)) {
@@ -1128,6 +1139,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
   });
 
   app.post("/api/agents/:name/move", async (c) => {
+    if(!access.canManageInstance(c.get('user')))return jsonResponse(c,{error:'Instance owner required'},403);
     const name = c.req.param("name");
     const user = c.get("user") as RequestUser | undefined;
     if (!access.canManageAgent(user, name)) {
@@ -1216,6 +1228,8 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       return jsonResponse(c, { error: "Forbidden" }, 403);
     }
     const action = c.req.param("action");
+    const configured=orm.select().from(schema.agents).where(eq(schema.agents.name,name)).get();
+    if(configured?.mode==='WRAPPED'&&action!=='stop'&&!access.canConfigureHostRuntime(user,configured.assigned_runner_id))return jsonResponse(c,{error:'Host runtime configuration requires operator approval'},403);
     if (!["start", "stop", "restart", "reload-skills", "cleanup-workspace"].includes(action)) {
       return jsonResponse(c, { error: "Invalid action" }, 400);
     }
@@ -1233,7 +1247,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       }
 
       const resolvedWorkspacePath = resolveWorkspacePath(workspacePath);
-      if (isUnsafeWorkspaceCleanupPath(resolvedWorkspacePath)) {
+      if (isUnsafeWorkspaceCleanupPath(resolvedWorkspacePath)||!isWithinPath(resolvedWorkspacePath,workspaceRoot,false)) {
         return jsonResponse(c, { error: "Refusing to clean unsafe workspace path" }, 400);
       }
 
@@ -1343,7 +1357,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
     if (!access.canViewAgent(user, name)) {
       return jsonResponse(c, { error: "Not found" }, 404);
     }
-    const workspaceResult = resolveAgentWorkspacePath(name);
+    const workspaceResult = resolveAgentWorkspacePath(name,user);
     if ("error" in workspaceResult) {
       return jsonResponse(c, { error: workspaceResult.error }, workspaceResult.status);
     }
@@ -1365,7 +1379,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
       return jsonResponse(c, { error: "Path is not a directory" }, 400);
     }
 
-    const entries = readdirSync(resolvedTarget.targetPath, { withFileTypes: true })
+    const entries = readdirSync(resolvedTarget.targetPath, { withFileTypes: true }).filter(entry=>!entry.isSymbolicLink())
       .map((entry) => {
         const absolutePath = resolve(resolvedTarget.targetPath, entry.name);
         const entryStat = statSync(absolutePath, { throwIfNoEntry: false });
@@ -1402,7 +1416,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
     if (!access.canViewAgent(user, name)) {
       return jsonResponse(c, { error: "Not found" }, 404);
     }
-    const workspaceResult = resolveAgentWorkspacePath(name);
+    const workspaceResult = resolveAgentWorkspacePath(name,user);
     if ("error" in workspaceResult) {
       return jsonResponse(c, { error: workspaceResult.error }, workspaceResult.status);
     }
@@ -1445,7 +1459,7 @@ export function registerAgentsRoutes(app: Hono<any>, deps: AgentsDeps) {
     if (!access.canViewAgent(user, name)) {
       return jsonResponse(c, { error: "Not found" }, 404);
     }
-    const workspaceResult = resolveAgentWorkspacePath(name);
+    const workspaceResult = resolveAgentWorkspacePath(name,user);
     if ("error" in workspaceResult) {
       return jsonResponse(c, { error: workspaceResult.error }, workspaceResult.status);
     }
